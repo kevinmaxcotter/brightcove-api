@@ -275,11 +275,11 @@ app.get('/search', async (req, res) => {
       return `
         <div class="vcard">
           <iframe src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
-                  allow="encrypted-media" allowfullscreen loading="lazy"
-                  title="${stripHtml(v.name)}"></iframe>
-          <div class="meta">
+                 meta">
             <div class="title">${stripHtml(v.name)}</div>
-       </div>
+            <div class="id">ID: ${v.id}</div>
+            <div class="tags"><strong>Tags:</strong> ${tags || '<em>None</em>'}</div>
+          </div>
         </div>`;
     }).join('');
 
