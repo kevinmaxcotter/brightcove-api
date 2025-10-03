@@ -358,7 +358,7 @@ app.get('/download', async (req, res) => {
       { header: 'Tags', key: 'tags', width: 40 },
     ];
 
-    for (const v of videos) {
+   for (const v of videos) {
       try {
         const row = await getMetricsForVideo(v.id, token);
         ws.addRow({ ...row, tags: (row.tags || []).join(', ') });
@@ -368,4 +368,21 @@ app.get('/download', async (req, res) => {
           id: v.id, title: v.name || 'ERROR',
           views: 'N/A', dailyAvgViews: 'N/A', impressions: 'N/A',
           engagement: 'N/A', playRate: 'N/A', secondsViewed: 'N/A',
-          tags: (v
+          tags: (v.tags || []).join(', ')
+        });
+      }
+    }
+
+    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    await wb.xlsx.write(res);
+    res.end();
+  } catch (err) {
+    console.error('Download error:', err.response?.status, err.response?.data || err.message);
+    res.status(500).send('Error generating spreadsheet.');
+  }
+});
+
+app.listen(PORT, () => {
+  console.log(`Server running at http://localhost:${PORT}`);
+});
