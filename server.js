@@ -222,8 +222,8 @@ app.get('/', (req, res) => {
   <main>
     <div class="card">
       <h2>🔍 Search by ID, Tag(s), or Title</h2>
-      /search
-        <label for="q">Enter terms (comma-separated)</label>
+      <form action="/search" method="get">
+terms (comma-separated)</label>
         <input id="q" name="q" placeholder='Examples: 6376653485112, pega platform, customer decision hub' required />
         <button class="btn" type="submit">Search & Watch</button>
         <div class="note">IDs → exact match. Multiple tags → AND. Titles → must contain all terms.</div>
@@ -234,7 +234,6 @@ app.get('/', (req, res) => {
 </body>
 </html>`);
 });
-
 
 // ---------------- UI: results with pagination ----------------
 app.get('/search', async (req, res) => {
