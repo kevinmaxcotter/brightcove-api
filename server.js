@@ -1,3 +1,4 @@
+
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -20,7 +21,7 @@ if (missing.length) {
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(express.static('public')); // put pega_logo.png here if you want a logo
+app.use(express.static('public'));
 
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 
@@ -88,20 +89,7 @@ async function fetchVideoById(id, token) {
   return r.data;
 }
 
-// ---------------- unified search (IDs + Tags AND + Title AND) ----------------
-/*
-Behavior:
-- If the input contains any numeric IDs → fetch those exact videos.
-- For the remaining non-ID terms:
-    * "Tags AND": video must include ALL those tags.
-    * "Title AND": video title must contain ALL those terms.
-- We fetch two pools from CMS to build a candidate set:
-    1) tags:"t1" tags:"t2" ... (AND)  (single query)
-    2) For each term, name:*term*  (multiple queries)
-  Then we apply local filters:
-    keep if hasAllTags(terms) OR titleContainsAll(terms)
-- Finally, merge with ID results, de-dupe, newest first.
-*/
+// ---------------- unified search ----------------
 async function unifiedSearch(input, token) {
   const terms = splitTerms(input);
   if (!terms.length) return [];
@@ -137,7 +125,6 @@ async function unifiedSearch(input, token) {
   pool.push(...byNameUnion);
 
   // Local filter for non-ID terms:
-  // Keep if the video has ALL tags OR the title contains ALL terms.
   let filtered = pool;
   if (nonIds.length) {
     filtered = pool.filter(v => hasAllTags(v, nonIds) || titleContainsAll(v, nonIds));
@@ -163,7 +150,7 @@ async function unifiedSearch(input, token) {
   return list;
 }
 
-// ---------------- metrics (all-time + daily avg + impressions etc.) ----------------
+// ---------------- metrics ----------------
 async function getMetricsForVideo(videoId, token) {
   const alltimeViewsUrl = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${videoId}`;
   const metricsUrl =
@@ -216,10 +203,7 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="utf-8" />
   <title>Brightcove Video Tools</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
-  <style>
-    body { font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#ffffff; color:#001f3f; margin:0; }
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin0;600;700&display=swap" rel="stylesheetmily:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#ffffff; color:#001f3f; margin:0; }
     header { display:flex; align-items:center; padding:20px; background:#fff; border-bottom:1px solid #e5e7eb; }
     header h1 { margin:0; font-size:1.8rem; font-weight:700; }
     main { display:flex; justify-content:center; align-items:center; flex-direction:column; padding:40px 20px; }
@@ -238,7 +222,7 @@ app.get('/', (req, res) => {
   <main>
     <div class="card">
       <h2>🔍 Search by ID, Tag(s), or Title</h2>
-      <form action="/search" method="get">
+      /search
         <label for="q">Enter terms (comma-separated)</label>
         <input id="q" name="q" placeholder='Examples: 6376653485112, pega platform, customer decision hub' required />
         <button class="btn" type="submit">Search & Watch</button>
@@ -251,9 +235,12 @@ app.get('/', (req, res) => {
 </html>`);
 });
 
-// ---------------- UI: results ----------------
+// ---------------- UI: results with pagination ----------------
 app.get('/search', async (req, res) => {
   const qInput = (req.query.q || '').trim();
+  const page = parseInt(req.query.page) || 1;
+  const limit = 100;
+
   if (!qInput) return res.redirect('/');
 
   try {
@@ -262,7 +249,27 @@ app.get('/search', async (req, res) => {
     const playerId = process.env.BRIGHTCOVE_PLAYER_ID;
     const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
 
-    const cards = videos.map(v => {
+    // Pagination logic
+    const totalVideos = videos.length;
+    const totalPages = Math.ceil(totalVideos / limit);
+    const start = (page - 1) * limit;
+    const end = start + limit;
+    const paginatedVideos = videos.slice(start, end);
+
+    // Pagination controls
+    let paginationControls = '';
+    if (totalPages > 1) {
+      paginationControls += `<div style="margin:16px 0;">`;
+      if (page > 1) {
+        paginationControls += `<a href="/search?q=${encodeURIComponent(qInput)}&page=${page-1}">&laquo;a> `;
+      }
+      paginationControls += `Page ${page} of ${totalPages}`;
+      if (page < totalPages) {
+        paginationControls += ` <a href="/search?q=${encodeURIComponent(qInput)}&page=${page+1}">Next &raquo;</a>`;
+   paginationControls += `</div>`;
+    }
+
+    const cards = paginatedVideos.map(v => {
       const tags = (v.tags || []).map(t => `<span class="tag">${stripHtml(t)}</span>`).join('');
       return `
         <div class="vcard">
@@ -271,9 +278,7 @@ app.get('/search', async (req, res) => {
                   title="${stripHtml(v.name)}"></iframe>
           <div class="meta">
             <div class="title">${stripHtml(v.name)}</div>
-            <div class="id">ID: ${v.id}</div>
-            <div class="tags"><strong>Tags:</strong> ${tags || '<em>None</em>'}</div>
-          </div>
+       </div>
         </div>`;
     }).join('');
 
@@ -282,8 +287,7 @@ app.get('/search', async (req, res) => {
 <head>
   <meta charset="utf-8"/>
   <title>Results for: ${stripHtml(qInput)}</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossoriginsplay=swap
   <style>
     :root{--navy:#001f3f;--muted:#6b7280;--chip:#eef2f7;--chipBorder:#c7ccd3}
     *{box-sizing:border-box}
@@ -312,9 +316,9 @@ app.get('/search', async (req, res) => {
   </header>
   <main>
     <div class="topbar">
-      <a class="back" href="/?q=${encodeURIComponent(qInput)}">← Back to search</a>
+      /?q=${encodeURIComponent(qInput)}&larr; Back to search</a>
       <a class="btn-dl" href="${downloadUrl}">Download Video Analytics Spreadsheet</a>
-    </div>
+nControls}
     <div class="card">
       <div class="grid">
         ${cards || '<div>No videos found.</div>'}
@@ -353,32 +357,3 @@ app.get('/download', async (req, res) => {
       { header: 'Tags', key: 'tags', width: 40 },
     ];
 
-    for (const v of videos) {
-      try {
-        const token = await getAccessToken();
-        const row = await getMetricsForVideo(v.id, token);
-        ws.addRow({ ...row, tags: (row.tags || []).join(', ') });
-      } catch (e) {
-        console.error(`Metrics error for ${v.id}:`, e.response?.data || e.message);
-        ws.addRow({
-          id: v.id, title: v.name || 'ERROR',
-          views: 'N/A', dailyAvgViews: 'N/A', impressions: 'N/A',
-          engagement: 'N/A', playRate: 'N/A', secondsViewed: 'N/A',
-          tags: (v.tags || []).join(', ')
-        });
-      }
-    }
-
-    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    await wb.xlsx.write(res);
-    res.end();
-  } catch (err) {
-    console.error('Download error:', err.response?.status, err.response?.data || err.message);
-    res.status(500).send('Error generating spreadsheet.');
-  }
-});
-
-app.listen(PORT, () => {
-  console.log(`Server running at http://localhost:${PORT}`);
-});
