@@ -275,11 +275,11 @@ app.get('/search', async (req, res) => {
       return `
         <div class="vcard">
           <iframe src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
-                  allow
+                  allow="encrypted-media" allowfullscreen loading="lazy"
+                  title="${stripHtml(v.name)}"></iframe>
+          <div class="meta">
             <div class="title">${stripHtml(v.name)}</div>
-            <div class="id">ID: ${v.id}</div>
-            <div class="tags"><strong>Tags:</strong> ${tags || '<em>None</em>'}</div>
-          </div>
+       </div>
         </div>`;
     }).join('');
 
@@ -316,7 +316,7 @@ app.get('/search', async (req, res) => {
   </header>
   <main>
     <div class="topbar">
-      <aq=${encodeURIComponent(qInput)}&larr; Back to search</a>
+      /?q=${encodeURIComponent(qInput)}&larr; Back to search</a>
       ${downloadUrl}Download Video Analytics Spreadsheet</a>
     </div>
     ${paginationControls}
@@ -365,3 +365,5 @@ app.get('/download', async (req, res) => {
       } catch (e) {
         console.error(`Metrics error for ${v.id}:`, e.response?.data || e.message);
         ws.addRow({
+          id: v.id, title: v.name || 'ERROR',
+          views: 'N/A', dailyAvgViews: 'N/A', impressions: 'N/A',
