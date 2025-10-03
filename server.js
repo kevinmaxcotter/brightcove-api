@@ -203,7 +203,8 @@ app.get('/', (req, res) => {
 <head>
   <meta charset="utf-8" />
   <title>Brightcove Video Tools</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin0;600;700&display=swap" rel="stylesheetmily:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#ffffff; color:#001f3f; margin:0; }
+  <style>
+    body { font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#ffffff; color:#001f3f; margin:0; }
     header { display:flex; align-items:center; padding:20px; background:#fff; border-bottom:1px solid #e5e7eb; }
     header h1 { margin:0; font-size:1.8rem; font-weight:700; }
     main { display:flex; justify-content:center; align-items:center; flex-direction:column; padding:40px 20px; }
@@ -261,12 +262,13 @@ app.get('/search', async (req, res) => {
     if (totalPages > 1) {
       paginationControls += `<div style="margin:16px 0;">`;
       if (page > 1) {
-        paginationControls += `<a href="/search?q=${encodeURIComponent(qInput)}&page=${page-1}">&laquo;a> `;
+        paginationControls += `/search?q=${encodeURIComponent(qInput)}&page=${page-1}&laquo; Previous</a> `;
       }
       paginationControls += `Page ${page} of ${totalPages}`;
       if (page < totalPages) {
-        paginationControls += ` <a href="/search?q=${encodeURIComponent(qInput)}&page=${page+1}">Next &raquo;</a>`;
-   paginationControls += `</div>`;
+        paginationControls += ` /search?q=${encodeURIComponent(qInput)}&page=${page+1}Next &raquo;</a>`;
+      }
+      paginationControls += `</div>`;
     }
 
     const cards = paginatedVideos.map(v => {
@@ -275,10 +277,9 @@ app.get('/search', async (req, res) => {
         <div class="vcard">
           <iframe src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
                   allow="encrypted-media" allowfullscreen loading="lazy"
-                  title="${stripHtml(v.name)}"></iframe>
-          <div class="meta">
-            <div class="title">${stripHtml(v.name)}</div>
-       </div>
+                  title="${strip"id">ID: ${v.id}</div>
+            <div class="tags"><strong>Tags:</strong> ${tags || '<em>None</em>'}</div>
+          </div>
         </div>`;
     }).join('');
 
@@ -287,7 +288,6 @@ app.get('/search', async (req, res) => {
 <head>
   <meta charset="utf-8"/>
   <title>Results for: ${stripHtml(qInput)}</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossoriginsplay=swap
   <style>
     :root{--navy:#001f3f;--muted:#6b7280;--chip:#eef2f7;--chipBorder:#c7ccd3}
     *{box-sizing:border-box}
@@ -317,8 +317,9 @@ app.get('/search', async (req, res) => {
   <main>
     <div class="topbar">
       /?q=${encodeURIComponent(qInput)}&larr; Back to search</a>
-      <a class="btn-dl" href="${downloadUrl}">Download Video Analytics Spreadsheet</a>
-nControls}
+      <a class="btn-dl" href="${downloadUrl}">Downloadet</a>
+    </div>
+    ${paginationControls}
     <div class="card">
       <div class="grid">
         ${cards || '<div>No videos found.</div>'}
@@ -357,3 +358,11 @@ app.get('/download', async (req, res) => {
       { header: 'Tags', key: 'tags', width: 40 },
     ];
 
+    for (const v of videos) {
+      try {
+        const row = await getMetricsForVideo(v.id, token);
+        ws.addRow({ ...row, tags: (row.tags || []).join(', ') });
+      } catch (e) {
+        console.error(`Metrics error for ${v.id}:`, e.response?.data || e.message);
+        ws.addRow({
+          id: v.id, title: v.name || 'ERROR',
