@@ -222,8 +222,7 @@ app.get('/', (req, res) => {
   <main>
     <div class="card">
       <h2>🔍 Search by ID, Tag(s), or Title</h2>
-      <form action="/search" method="get">
-terms (comma-separated)</label>
+      <form action="/search" method="geter terms (comma-separated)</label>
         <input id="q" name="q" placeholder='Examples: 6376653485112, pega platform, customer decision hub' required />
         <button class="btn" type="submit">Search & Watch</button>
         <div class="note">IDs → exact match. Multiple tags → AND. Titles → must contain all terms.</div>
@@ -261,9 +260,8 @@ app.get('/search', async (req, res) => {
     if (totalPages > 1) {
       paginationControls += `<div style="margin:16px 0;">`;
       if (page > 1) {
-        paginationControls += `<a href="/search?q=${encodeURIComponent(qInput)}&page=${page-1}">&laquo/a> `;
-      }
-      paginationControls += `Page ${page} of ${totalPages}`;
+        paginationControls += `<a href="/search?q=${encodeURIComponent(qInput)}&page=${page-1}">&laquo; Previous</a> `;
+   paginationControls += `Page ${page} of ${totalPages}`;
       if (page < totalPages) {
         paginationControls += ` /search?q=${encodeURIComponent(qInput)}&page=${page+1}Next &raquo;</a>`;
       }
@@ -277,9 +275,8 @@ app.get('/search', async (req, res) => {
           <iframe src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
                   allow="encrypted-media" allowfullscreen loading="lazy"
                   title="${stripHtml(v.name)}"></iframe>
-          <div class="meta">
-            <div class="title">${stripHtml(v.name)}</div>
-       </div>
+          <div class="tags"><strong>Tags:</strong> ${tags || '<em>None</em>'}</div>
+          </div>
         </div>`;
     }).join('');
 
@@ -316,7 +313,8 @@ app.get('/search', async (req, res) => {
   </header>
   <main>
     <div class="topbar">
-      <a class="back" href="/?q=${encodeURIComponent(qInput)}">&larr; Back to search</l" href="${downloadUrl}">Download Video Analytics SpreadsheetnationControls}
+      /?q=${encodeURIComponent(qInput)}&larr; Back to search</a>
+      <a class="btn-dl" href="${downloadUrl}">Download Video Analytics SpreadsheetnationControls}
     <div class="card">
       <div class="grid">
         ${cards || '<div>No videos found.</div>'}
@@ -358,8 +356,3 @@ app.get('/download', async (req, res) => {
     for (const v of videos) {
       try {
         const row = await getMetricsForVideo(v.id, token);
-        ws.addRow({ ...row, tags: (row.tags || []).join(', ') });
-      } catch (e) {
-        console.error(`Metrics error for ${v.id}:`, e.response?.data || e.message);
-        ws.addRow({
-          id: v.id, title: v.name || 'ERROR',
