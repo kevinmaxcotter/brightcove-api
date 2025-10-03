@@ -275,9 +275,8 @@ app.get('/search', async (req, res) => {
       return `
         <div class="vcard">
           <iframe src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
-                 meta">
-            <div class="title">${stripHtml(v.name)}</div>
-            <div class="id">ID: ${v.id}</div>
+                  allow="encrypted-media" allowfullscreen loading="lazy"
+                  titleiv class="id">ID: ${v.id}</div>
             <div class="tags"><strong>Tags:</strong> ${tags || '<em>None</em>'}</div>
           </div>
         </div>`;
@@ -367,3 +366,4 @@ app.get('/download', async (req, res) => {
         ws.addRow({
           id: v.id, title: v.name || 'ERROR',
           views: 'N/A', dailyAvgViews: 'N/A', impressions: 'N/A',
+          engagement: 'N/A', playRate: 'N/A', secondsViewed: 'N
