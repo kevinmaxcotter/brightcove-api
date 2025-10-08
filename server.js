@@ -313,7 +313,7 @@ app.get('/', async (req, res) => {
       <div class="thumb-wrap">
         <img src="${escapeHtml(v.thumb)}" alt="${escapeHtml(v.name)}">
         <div class="r-title">${escapeHtml(v.name)}</div>
-        <div class="r-sub">ID: ${v.id} • ${fmtDate(v.created_at)}</div>
+        <div class="r-sub">ID: ${v.id} â€¢ ${fmtDate(v.created_at)}</div>
       </div>
     </a>
   `,
@@ -387,7 +387,7 @@ app.get('/search', async (req, res) => {
           src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
           allow="autoplay; encrypted-media"
           allowe)}</div>
-          <div class="id">ID: ${v.id} • ${fmtDate(v.created_at)}</div>
+          <div class="id">ID: ${v.id} â€¢ ${fmtDate(v.created_at)}</div>
         </div>
       </div>
     `,
@@ -414,7 +414,7 @@ app.get('/search', async (req, res) => {
   </style>
 </head>
 <body>
-  <← Back</a> | <{downloadUrl}Download Spreadsheet</a>
+  <â† Back</a> | <{downloadUrl}Download Spreadsheet</a>
   <div class="grid">${cards || '<p>No videos found.</p>'}</div>
 </body>
 </html>`);
