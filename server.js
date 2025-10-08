@@ -1,5 +1,14 @@
-// server.js — Brightcove tools with improved embed URL discovery for Pega sites
-// UI/metrics unchanged. Scanner now deep-scans assets from *.pega.com by default.
+// server.js — Brightcove tools with Analytics-based embed URL discovery
+// Features:
+// - Home: search form + most recent uploads
+// - Results: playable cards, tags, download button
+// - Spreadsheet: all-time metrics + "Embedded On (URLs)" via Analytics destination_domain/path
+// - Light/Dark toggle with emojis
+// - /healthz for Render health checks
+//
+// Notes:
+// - No sitemap/JS crawling (more reliable and faster).
+// - If required env vars are missing, app still boots and shows a banner.
 
 require('dotenv').config();
 const express = require('express');
@@ -7,7 +16,6 @@ const axios = require('axios');
 const ExcelJS = require('exceljs');
 const http = require('http');
 const https = require('https');
-const zlib = require('zlib');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -20,8 +28,7 @@ process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION:', err?
 const MUST = ['BRIGHTCOVE_ACCOUNT_ID','BRIGHTCOVE_CLIENT_ID','BRIGHTCOVE_CLIENT_SECRET','BRIGHTCOVE_PLAYER_ID'];
 const missing = MUST.filter(k => !process.env[k]);
 if (missing.length) {
-  console.error('Missing .env keys:', missing.join(', '));
-  // keep process alive so you can see UI; routes will handle error states
+  console.error('Missing .env keys:', missing.join(', ')); // keep running; show banner in UI
 }
 
 /* ---------- config ---------- */
@@ -30,31 +37,10 @@ const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID || '';
 
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
-
-// Time budgets (ms)
 const DOWNLOAD_TIME_BUDGET_MS = Number(process.env.DOWNLOAD_TIME_BUDGET_MS || 60000);
-const SCAN_TIME_BUDGET_MS     = Number(process.env.SCAN_TIME_BUDGET_MS || 25000);
-
-// Concurrency
 const METRICS_CONCURRENCY = Number(process.env.METRICS_CONCURRENCY || 6);
-const SCAN_CONCURRENCY    = Number(process.env.SCAN_CONCURRENCY || 8);
+const EMBED_CONCURRENCY = Number(process.env.EMBED_CONCURRENCY || 6);
 
-// Scan size/limits
-const SCAN_DOMAINS = (process.env.SCAN_DOMAINS || 'community.pega.com,academy.pega.com')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 1200);
-const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 12000);
-const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.1';
-
-// Deep scan flags
-const SCAN_DEEP = /^true$/i.test(String(process.env.SCAN_DEEP || 'true')); // default ON
-// allow assets from *.pega.com by default
-const SCAN_ASSET_SUFFIXES = (process.env.SCAN_ASSET_SUFFIXES || 'pega.com')
-  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-const SCAN_MAX_ASSETS_PER_PAGE = Number(process.env.SCAN_MAX_ASSETS_PER_PAGE || 6);
-const SCAN_MAX_ASSET_BYTES = Number(process.env.SCAN_MAX_ASSET_BYTES || 400000); // ~400KB cap per asset
-
-// CMS paging
 const CMS_PAGE_LIMIT = 100;
 
 /* ---------- axios keep-alive ---------- */
@@ -257,6 +243,38 @@ async function getAnalyticsForVideo(videoId, token) {
   return { id: videoId, title, tags, views, dailyAvgViews, impressions, engagement, playRate, secondsViewed };
 }
 
+/* ---------- NEW: embed URLs from Analytics (all-time) ---------- */
+// Returns a Set of full page URLs (https://domain/path) where the video recorded views (all-time)
+async function getEmbedUrlsFromAnalytics(videoId, token) {
+  const base = 'https://analytics.api.brightcove.com/v1/data';
+  const params = new URLSearchParams({
+    accounts: AID,
+    dimensions: 'destination_domain,destination_path',
+    where: `video==${videoId}`,
+    from: 'alltime',
+    to: 'now',
+    limit: '10000'
+  });
+  const url = `${base}?${params.toString()}`;
+
+  const { data } = await withRetry(() =>
+    axiosHttp.get(url, { headers: { Authorization: `Bearer ${token}` } })
+  );
+
+  const out = new Set();
+  const items = data?.items || [];
+  for (const it of items) {
+    const dom = (it.destination_domain || '').trim();
+    let path = (it.destination_path || '').trim();
+    if (!dom) continue;
+    if (!path) path = '/';
+    if (!path.startsWith('/')) path = '/' + path;
+    // Filter to https since most pages are https; if you need http, change below.
+    out.add(`https://${dom}${path}`);
+  }
+  return out;
+}
+
 /* ---------- UI (unchanged) ---------- */
 function themeHead(){ return `
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -323,7 +341,8 @@ app.get('/', async (req, res) => {
         </div>
       </div>
     `).join('');
-  } catch {
+  } catch (e) {
+    console.error('Recent fetch error:', e?.response?.data || e.message);
     recentHTML = '<div class="id">Error fetching recent videos.</div>';
   }
 
@@ -416,242 +435,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Scanner: sitemap + deep asset scan (pega.com allow-list) ---------- */
-
-function logScan(msg, extra){ try{ console.log('[scan]', msg, extra||''); }catch{} }
-
-async function fetchBinary(url, timeoutMs = SCAN_TIMEOUT_MS) {
-  return axiosHttp.get(url, {
-    timeout: timeoutMs,
-    responseType: 'arraybuffer',
-    headers: {
-      'User-Agent': SCAN_USER_AGENT,
-      'Accept-Encoding': 'br,gzip,deflate'
-    },
-    validateStatus: s => s>=200 && s<400
-  }).then(r => ({ data: r.data, headers: r.headers }));
-}
-// Brotli-safe decode
-function decodeBody({ data, headers }, url) {
-  let buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
-  const enc = (headers['content-encoding'] || '').toLowerCase();
-  try {
-    if (enc.includes('br') && typeof zlib.brotliDecompressSync === 'function') {
-      buf = zlib.brotliDecompressSync(buf);
-    } else if (enc.includes('gzip')) {
-      buf = zlib.gunzipSync(buf);
-    } else if (enc.includes('deflate')) {
-      buf = zlib.inflateSync(buf);
-    } else if (/\.gz(\?|$)/i.test(url)) {
-      buf = zlib.gunzipSync(buf);
-    }
-  } catch {}
-  return buf.toString('utf8');
-}
-async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
-  const res = await fetchBinary(url, timeoutMs);
-  return decodeBody(res, url);
-}
-
-function parseSitemapLocs(xml) {
-  const locs = [];
-  const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi; let m;
-  while ((m = re.exec(xml))) locs.push(m[1]);
-  return locs;
-}
-function hostAllowed(host, baseHost, suffixes) {
-  const h = host.toLowerCase();
-  const base = baseHost.toLowerCase();
-  if (h === base) return true;
-  const base2 = base.split('.').slice(-2).join('.');
-  if (h.endsWith('.'+base2)) return true;
-  for (const suf of suffixes) if (h === suf || h.endsWith('.'+suf)) return true;
-  return false;
-}
-async function discoverSitemapsForDomain(domain) {
-  const cands = new Set();
-  const bases = [`https://${domain}`, `http://${domain}`];
-  for (const base of bases) {
-    try {
-      const robots = await fetchText(`${base}/robots.txt`);
-      const lines = robots.split(/\r?\n/);
-      for (const ln of lines) {
-        const m = ln.match(/^\s*Sitemap:\s*(\S+)\s*$/i);
-        if (m && m[1]) cands.add(m[1].trim());
-      }
-    } catch {}
-    cands.add(`${base}/sitemap.xml`);
-    cands.add(`${base}/sitemap_index.xml`);
-    cands.add(`${base}/sitemap.xml.gz`);
-  }
-  return Array.from(cands);
-}
-async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
-  const allowed = domains.map(d => d.toLowerCase());
-  const pages = new Set();
-
-  function urlAllowed(u) {
-    try {
-      const x = new URL(u);
-      if (!/^https?:$/.test(x.protocol)) return false;
-      const h = x.hostname.toLowerCase();
-      for (const d of allowed) if (h===d || h.endsWith('.'+d)) return true;
-      return false;
-    } catch { return false; }
-  }
-  async function processSitemap(url) {
-    if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) return;
-    try {
-      const xml = await fetchText(url);
-      const locs = parseSitemapLocs(xml);
-      const subs = locs.filter(u => /\.xml(\.gz)?$/i.test(u));
-      if (subs.length && subs.length >= locs.length * 0.5) {
-        for (const u of subs) {
-          if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
-          if (urlAllowed(u)) await processSitemap(u);
-        }
-      } else {
-        for (const u of locs) {
-          if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
-          if (urlAllowed(u)) pages.add(u);
-        }
-      }
-    } catch (e) { logScan('sitemap failed', { url, err: e.message }); }
-  }
-
-  for (const d of domains) {
-    const sitemaps = await discoverSitemapsForDomain(d);
-    logScan('sitemaps discovered', { domain: d, count: sitemaps.length });
-    await Promise.allSettled(sitemaps.map(processSitemap));
-    logScan('pages so far', { domain: d, pages: pages.size });
-    if (pages.size >= maxPagesTotal || Date.now() >= deadlineTs) break;
-  }
-  return Array.from(pages);
-}
-
-/* ID-specific patterns (expanded a bit) */
-function buildPatternsForId(vid) {
-  const id = String(vid).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
-  return [
-    new RegExp(`videoId=${id}(?:[^0-9]|$)`, 'i'),
-    new RegExp(`data-video-id=["']${id}["']`, 'i'),
-    new RegExp(`data-video-id=${id}(?:\\b|[^0-9])`, 'i'),
-    new RegExp(`data-brightcove-video-id=["']${id}["']`, 'i'),
-    new RegExp(`data-experience-video-id=["']${id}["']`, 'i'),
-    new RegExp(`"videoId"\\s*:\\s*["']${id}["']`, 'i'),
-    new RegExp(`'videoId'\\s*:\\s*'${id}'`, 'i'),
-    new RegExp(`"video_id"\\s*:\\s*["']?${id}["']?`, 'i'),
-    new RegExp(`'video_id'\\s*:\\s*['"]?${id}['"]?`, 'i'),
-    new RegExp(`"brightcoveVideoId"\\s*:\\s*["']${id}["']`, 'i'),
-    new RegExp(`"bcVideoId"\\s*:\\s*["']${id}["']`, 'i'),
-    new RegExp(`\\bdata-video-id=${id}\\b`, 'i'),
-    // function init patterns
-    new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${id}["']`, 'i'),
-    new RegExp(`brightcove[\\s\\S]{0,200}?["']${id}["']`, 'i'),
-    // meta & data attributes sometimes used
-    new RegExp(`<meta[^>]+content=["'][^"']*${id}[^"']*["'][^>]*>`, 'i'),
-    new RegExp(`data-bcvid=["']${id}["']`, 'i'),
-  ];
-}
-
-/* Extract candidate asset URLs from HTML (scripts/JSON) — allows *.pega.com */
-function extractAssetUrls(pageUrl, html) {
-  const out = new Set();
-  const base = new URL(pageUrl);
-
-  const allowHost = (h) => hostAllowed(h, base.hostname, SCAN_ASSET_SUFFIXES);
-
-  const add = (u) => {
-    try {
-      const x = new URL(u, base);
-      if (allowHost(x.hostname)) out.add(x.toString());
-    } catch {}
-  };
-  // <script src="...">
-  html.replace(/<script[^>]+src=["']([^"']+)["'][^>]*>/gi, (_, u) => { add(u); return _; });
-  // <link rel="preload" as="script" href="...">
-  html.replace(/<link[^>]+rel=["']preload["'][^>]+as=["']script["'][^>]+href=["']([^"']+)["'][^>]*>/gi, (_, u) => { add(u); return _; });
-  // JSON endpoints sometimes linked as <link rel="preload" as="fetch"> (allow small subset)
-  html.replace(/<link[^>]+rel=["']preload["'][^>]+as=["']fetch["'][^>]+href=["']([^"']+\\.(?:json|txt))["'][^>]*>/gi, (_, u) => { add(u); return _; });
-
-  return Array.from(out).slice(0, SCAN_MAX_ASSETS_PER_PAGE);
-}
-
-/* Fetch a snippet from an asset, capped */
-async function fetchAssetSnippet(url) {
-  try {
-    const { data, headers } = await fetchBinary(url);
-    const len = Number(headers['content-length'] || '0');
-    if (len && len > SCAN_MAX_ASSET_BYTES) {
-      const slice = decodeBody({ data: data.subarray(0, Math.min(data.length, SCAN_MAX_ASSET_BYTES)), headers }, url);
-      return slice;
-    }
-    const txt = decodeBody({ data, headers }, url);
-    return txt.length > SCAN_MAX_ASSET_BYTES ? txt.slice(0, SCAN_MAX_ASSET_BYTES) : txt;
-  } catch {
-    return '';
-  }
-}
-
-/* Page scan: HTML first; if not found & SCAN_DEEP=true, scan a few assets */
-async function scanPageForIds(pageUrl, ids) {
-  try {
-    const html = await fetchText(pageUrl);
-    const hits = new Map(); // id -> where ('html' or asset url)
-
-    // HTML
-    for (const vid of ids) {
-      const pats = buildPatternsForId(vid);
-      for (const rx of pats) { if (rx.test(html)) { hits.set(String(vid), 'html'); break; } }
-    }
-    if (hits.size === ids.length || !SCAN_DEEP) {
-      return Array.from(hits.entries()).map(([id]) => ({ id, url: pageUrl }));
-    }
-
-    // Deep assets
-    const assets = extractAssetUrls(pageUrl, html);
-    for (const assetUrl of assets) {
-      if (hits.size === ids.length) break;
-      const txt = await fetchAssetSnippet(assetUrl);
-      if (!txt) continue;
-      for (const vid of ids) {
-        if (hits.has(String(vid))) continue;
-        const pats = buildPatternsForId(vid);
-        for (const rx of pats) { if (rx.test(txt)) { hits.set(String(vid), assetUrl); break; } }
-      }
-    }
-
-    return Array.from(hits.entries()).map(([id]) => ({ id, url: pageUrl }));
-  } catch {
-    return [];
-  }
-}
-
-async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX_PAGES, concurrency = SCAN_CONCURRENCY, timeBudgetMs = SCAN_TIME_BUDGET_MS } = {}) {
-  if (!domains.length || !ids.length) return new Map();
-  const deadlineTs = Date.now() + Math.max(1000, timeBudgetMs);
-
-  const pages = await discoverPagesFromSitemaps(domains, maxPages, deadlineTs);
-  logScan('discovered pages total', { count: pages.length, domains });
-
-  let i = 0; const found = new Map(); for (const id of ids) found.set(String(id), new Set());
-
-  async function worker() {
-    while (i < pages.length && Date.now() < deadlineTs) {
-      const idx = i++; const url = pages[idx];
-      const hits = await scanPageForIds(url, ids);
-      for (const h of hits) found.get(h.id).add(h.url);
-    }
-  }
-  await Promise.all(Array.from({length: Math.min(concurrency, pages.length)}, worker));
-
-  const totals = {}; for (const [id, set] of found.entries()) totals[id] = set.size;
-  logScan('scan summary', { totals });
-
-  return found; // Map(id -> Set(url))
-}
-
-/* ---------- Download (time-budgeted & concurrent) ---------- */
+/* ---------- Download (analytics + embed URLs from Analytics) ---------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -667,9 +451,7 @@ app.get('/download', async (req, res) => {
     let truncated = false;
     if (videos.length > DOWNLOAD_MAX_VIDEOS) { videos = videos.slice(0, DOWNLOAD_MAX_VIDEOS); truncated = true; }
 
-    const ids = videos.map(v => v.id);
-
-    // analytics with concurrency + deadline guard
+    // ---- metrics (concurrent, deadline-guarded) ----
     const rows = new Array(videos.length);
     let idxA = 0;
 
@@ -699,11 +481,28 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    const scanBudgetLeft = Math.max(0, Math.min(SCAN_TIME_BUDGET_MS, dlDeadline - Date.now() - 2000));
-    const embedsMap = await runSitemapScan(ids, { timeBudgetMs: scanBudgetLeft });
+    // ---- embed URLs from Analytics (concurrent) ----
+    const embedsMap = new Map();
+    let idxE = 0;
+    async function embedWorker() {
+      while (idxE < videos.length) {
+        const i = idxE++; const v = videos[i];
+        try {
+          const urls = await getEmbedUrlsFromAnalytics(v.id, token);
+          embedsMap.set(String(v.id), urls);
+        } catch (e) {
+          console.error('Embed analytics error for', v.id, e?.response?.data || e.message);
+          embedsMap.set(String(v.id), new Set());
+        }
+      }
+    }
+    await Promise.all(Array.from({ length: Math.min(EMBED_CONCURRENCY, videos.length) }, embedWorker));
 
+    // ---- build workbook ----
     const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet('Video Metrics (All-Time)');
+    const ws = new ExcelJS.Worksheet(wb, 'Video Metrics (All-Time)');
+    wb.addWorksheet(ws); // ensure consistent API in some ExcelJS versions
+
     ws.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
       { header: 'Title', key: 'title', width: 40 },
@@ -717,7 +516,7 @@ app.get('/download', async (req, res) => {
       { header: 'Embedded On (URLs)', key: 'embeddedOn', width: 80 },
     ];
     if (truncated) ws.addRow({ id:'NOTE', title:`Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` });
-    if (Date.now() >= dlDeadline) ws.addRow({ id:'NOTE', title:`Export reached time budget; some rows may show N/A or partial embeds.` });
+    if (Date.now() >= dlDeadline) ws.addRow({ id:'NOTE', title:`Export reached time budget; some rows may show N/A.` });
 
     const titleById = new Map(videos.map(v => [String(v.id), v.name || 'Untitled']));
     const tagsById  = new Map(videos.map(v => [String(v.id), v.tags || []]));
@@ -738,14 +537,20 @@ app.get('/download', async (req, res) => {
       });
     }
 
+    // optional second sheet listing one URL per row
     const wf = wb.addWorksheet('Embeds Found');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
       { header: 'Page URL', key: 'url', width: 90 },
     ];
-    for (const [vid, set] of embedsMap.entries()) for (const u of set) wf.addRow({ id: vid, url: u });
-    if (!embedsMap.size) wf.addRow({ id:'INFO', url:'No embeds found within time budget; verify SCAN_DOMAINS or increase SCAN_MAX_PAGES/SCAN_TIME_BUDGET_MS.' });
+    for (const [vid, set] of embedsMap.entries()) {
+      for (const u of set) wf.addRow({ id: vid, url: u });
+    }
+    if (![...embedsMap.values()].some(s => s && s.size)) {
+      wf.addRow({ id:'INFO', url:'No embed URLs returned by Analytics for selected videos (all-time).' });
+    }
 
+    // stream workbook
     const buf = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -757,38 +562,8 @@ app.get('/download', async (req, res) => {
   }
 });
 
-/* ---------- Debug endpoint: see why a specific page matches or not ---------- */
-app.get('/debug-embed', async (req, res) => {
-  const id = (req.query.id || '').trim();
-  const url = (req.query.url || '').trim();
-  if (!looksLikeId(id) || !url) return res.status(400).send('Use /debug-embed?id=<VIDEO_ID>&url=<PAGE_URL>');
-
-  try {
-    const html = await fetchText(url);
-    const pats = buildPatternsForId(id);
-    let where = 'none';
-    for (const rx of pats) { if (rx.test(html)) { where = 'html'; break; } }
-
-    let assets = [];
-    let assetHit = null;
-
-    if (where === 'none' && SCAN_DEEP) {
-      assets = extractAssetUrls(url, html);
-      for (const a of assets) {
-        const txt = await fetchAssetSnippet(a);
-        for (const rx of pats) { if (rx.test(txt)) { assetHit = a; break; } }
-        if (assetHit) break;
-      }
-      if (assetHit) where = `asset: ${assetHit}`;
-    }
-
-    res.json({ videoId: id, url, foundIn: where, assetsChecked: assets });
-  } catch (e) {
-    res.status(500).send('Failed to fetch page: ' + (e?.message || 'unknown error'));
-  }
-});
-
 /* ---------- 404 + start ---------- */
+app.get('/healthz', (_req, res) => res.send('ok'));
 app.use((req, res) => res.status(404).send('Not found'));
 const server = app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
 server.keepAliveTimeout = 120000;
