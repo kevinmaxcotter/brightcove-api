@@ -1,4 +1,4 @@
-// server.js — Precise Tag/Title/ID search (returns ALL tag matches) + Light/Dark + Recent Uploads + Robust Export
+// server.js — ALL-TIME analytics guaranteed + precise search + placements auto-fallback + light/dark + recent uploads
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -24,11 +24,11 @@ if (missing.length) {
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 
-// Recent uploads on home
+// Home page: how many recent uploads to show
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 
-// Analytics placements window (e.g. "-90d" or "alltime")
-const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime';
+// *** IMPORTANT: keep all analytics all-time by default ***
+const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime'; // keep 'alltime' to align with your ask
 
 // Search scope
 const SEARCH_ACTIVE_ONLY = String(process.env.SEARCH_ACTIVE_ONLY || 'false').toLowerCase() === 'true';
@@ -99,11 +99,7 @@ const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 const esc = s => String(s).replace(/"/g, '\\"');
 
-// Parse comma-separated search string into explicit buckets:
-// - id:1234567890123  OR bare numeric -> ids
-// - tag:foo (quoted allowed)          -> tagTerms
-// - title:bar (quoted allowed)        -> titleTerms
-// - bare tokens -> treated as tags (so "pega platform" == tag:"pega platform")
+// Parse comma-separated search string into explicit buckets
 function parseQuery(input) {
   const raw = String(input || '')
     .split(',')
@@ -115,10 +111,7 @@ function parseQuery(input) {
   const titleTerms = [];
 
   for (let tok of raw) {
-    // unquote "..." or '...'
     tok = tok.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
-
-    // explicit prefixes
     const m = tok.match(/^(id|tag|title)\s*:(.*)$/i);
     if (m) {
       const key = m[1].toLowerCase();
@@ -129,12 +122,8 @@ function parseQuery(input) {
       else if (key === 'title') { titleTerms.push(val); }
       continue;
     }
-
-    // bare numeric -> id
     if (looksLikeId(tok)) { ids.push(tok); continue; }
-
-    // otherwise treat as a tag token
-    tagTerms.push(tok);
+    tagTerms.push(tok); // bare tokens = tags
   }
 
   return { ids, tagTerms, titleTerms };
@@ -153,7 +142,6 @@ async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = 
   return data || [];
 }
 
-// Fetch ALL pages for a query (authoritative for tag searches)
 async function fetchAllPagesUnlimited(q, token) {
   const out = [];
   let offset = 0;
@@ -162,12 +150,11 @@ async function fetchAllPagesUnlimited(q, token) {
     out.push(...batch);
     if (batch.length < CMS_PAGE_LIMIT) break;
     offset += CMS_PAGE_LIMIT;
-    if (out.length >= CMS_HARD_CAP_ALLPAGES) break; // very large safety ceiling
+    if (out.length >= CMS_HARD_CAP_ALLPAGES) break;
   }
   return out;
 }
 
-// Fetch pages with a conservative budget (used for *title* queries only)
 async function fetchAllPagesCapped(q, token) {
   const out = [];
   let offset = 0;
@@ -200,66 +187,55 @@ async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
     name: v.name || 'Untitled',
     tags: v.tags || [],
     created_at: v.created_at,
+    published_at: v.published_at,
     thumb: v.images?.thumbnail?.src || v.images?.poster?.src || 'https://via.placeholder.com/320x180.png?text=No+Thumbnail'
   }));
 }
 
-// ---- UNIFIED SEARCH (ID + TAG + TITLE; full tag coverage) ----
+// ---- UNIFIED SEARCH ----
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
-
   const pool = [];
 
-  // 1) IDs (exact)
+  // IDs
   const idFetches = ids.map(id =>
     fetchVideoById(id, token)
       .then(v => { if (v && v.id) pool.push(v); })
       .catch(() => {})
   );
 
-  // 2) TAGS (AND): authoritative, fetch ALL pages
-  let tagMatches = [];
+  // TAGS (AND) — authoritative, fetch ALL pages
   if (tagTerms.length) {
-    // Build q: tags:"t1" tags:"t2" ... ; optionally constrain to ACTIVE if env set
     const parts = [...tagTerms.map(t => `tags:"${esc(t)}"`)];
-    if (SEARCH_ACTIVE_ONLY) parts.unshift('state:ACTIVE'); // else all states
+    if (SEARCH_ACTIVE_ONLY) parts.unshift('state:ACTIVE');
     const qTags = parts.join(' ');
     try {
-      tagMatches = await fetchAllPagesUnlimited(qTags, token);
-      pool.push(...tagMatches);
-      console.log(`[search] tag AND q="${qTags}" -> ${tagMatches.length} items`);
+      const rows = await fetchAllPagesUnlimited(qTags, token);
+      pool.push(...rows);
+      console.log(`[search] TAG AND q="${qTags}" -> ${rows.length}`);
     } catch (e) {
       console.error('[search][tags] failed', e.response?.status, e.response?.data || e.message);
     }
   }
 
-  // 3) TITLE (AND): capped
+  // TITLE (AND) — capped per term; intersect locally
   if (titleTerms.length) {
-    // One query per term, union results locally, then require AND by filtering
-    const resultsPerTerm = await Promise.allSettled(
+    const perTerm = await Promise.allSettled(
       titleTerms.map(t => {
         const parts = [`name:*${esc(t)}*`];
         if (SEARCH_ACTIVE_ONLY) parts.unshift('state:ACTIVE');
-        const qName = parts.join(' ');
-        return fetchAllPagesCapped(qName, token);
+        return fetchAllPagesCapped(parts.join(' '), token);
       })
     );
-
-    // Union then AND-filter: keep videos that appeared in all term result sets
-    const buckets = resultsPerTerm
+    const buckets = perTerm
       .map(r => (r.status === 'fulfilled' ? r.value : []))
       .map(arr => new Map(arr.map(v => [v.id, v])));
-
     if (buckets.length) {
       const idCounts = new Map();
-      for (const b of buckets) {
-        for (const id of b.keys()) idCounts.set(id, (idCounts.get(id) || 0) + 1);
-      }
+      for (const b of buckets) for (const id of b.keys()) idCounts.set(id, (idCounts.get(id) || 0) + 1);
       const andIds = [...idCounts.entries()].filter(([, c]) => c === buckets.length).map(([id]) => id);
-      const firstBucket = buckets[0];
-      const titleAndMatches = andIds.map(id => firstBucket.get(id)).filter(Boolean);
-      pool.push(...titleAndMatches);
-      console.log(`[search] title AND terms=${JSON.stringify(titleTerms)} -> ${titleAndMatches.length} items`);
+      const first = buckets[0];
+      pool.push(...andIds.map(id => first.get(id)).filter(Boolean));
     }
   }
 
@@ -275,29 +251,29 @@ async function unifiedSearch(input, token) {
       id: v.id,
       name: v.name || 'Untitled',
       tags: v.tags || [],
-      thumb: v.images?.thumbnail?.src || v.images?.poster?.src || 'https://via.placeholder.com/320x180.png?text=No+Thumbnail',
-      created_at: v.created_at
+      created_at: v.created_at,
+      published_at: v.published_at,
+      thumb: v.images?.thumbnail?.src || v.images?.poster?.src || 'https://via.placeholder.com/320x180.png?text=No+Thumbnail'
     });
   }
 
-  // Newest first
-  list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
-  console.log(`[search] final unique results: ${list.length}`);
+  list.sort((a, b) => new Date(b.created_at || 0) - new Date(a.created_at || 0));
   return list;
 }
 
-// ---- ANALYTICS (BATCHED) ----
+// ---- ALL-TIME ANALYTICS (BATCHED) ----
+// Every metric here is guaranteed to be all-time via from=alltime&to=now
 async function getAnalyticsForVideos(videoIds, token) {
   if (!Array.isArray(videoIds) || videoIds.length === 0) return [];
   const endpoint = 'https://analytics.api.brightcove.com/v1/data';
   const fields = [
-    'video',
+    'video',                // id
     'video_name',
-    'video_view',
-    'video_impression',
-    'play_rate',
-    'engagement_score',
-    'video_seconds_viewed'
+    'video_view',           // ALL-TIME views (because from=alltime)
+    'video_impression',     // ALL-TIME impressions
+    'play_rate',            // computed by Brightcove for the selected range
+    'engagement_score',     // likewise
+    'video_seconds_viewed'  // ALL-TIME seconds viewed
   ].join(',');
 
   const chunks = [];
@@ -309,7 +285,7 @@ async function getAnalyticsForVideos(videoIds, token) {
       accounts: AID,
       dimensions: 'video',
       fields,
-      from: 'alltime',
+      from: 'alltime',  // <<<<<< ALL-TIME
       to: 'now',
       where: `video==${batch.join(',')}`
     });
@@ -333,7 +309,7 @@ async function detectDestinationCapability(token) {
     accounts: AID,
     dimensions: 'destination_domain,destination_path',
     fields: 'video_view',
-    from: PLACEMENTS_WINDOW,
+    from: PLACEMENTS_WINDOW, // default 'alltime'
     to: 'now',
     limit: '1'
   });
@@ -697,10 +673,9 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- ANALYTICS + PLACEMENTS EXPORT (auto fallback) ----
+// ---- DOWNLOAD: ALL-TIME METRICS + PLACEMENTS ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
-  const debug = req.query.debug === '1';
   if (!qInput) return res.status(400).send('Missing search terms');
 
   try {
@@ -710,30 +685,15 @@ app.get('/download', async (req, res) => {
 
     const ids = videos.map(v => v.id);
 
-    // Core analytics
-    let analytics = [];
-    try {
-      analytics = await getAnalyticsForVideos(ids, token);
-    } catch (e) {
-      console.error('[analytics] error', e.response?.status, e.response?.data || e.message);
-      if (debug) return res.status(502).json({ step: 'analytics', status: e.response?.status, body: e.response?.data || e.message });
-    }
-    const aMap = new Map();
-    for (const item of analytics) aMap.set(String(item.video), item);
+    // ALL-TIME analytics
+    const analytics = await getAnalyticsForVideos(ids, token);
+    const aMap = new Map(analytics.map(a => [String(a.video), a]));
 
-    // Placements (auto-detect)
-    let placementsMode = 'playerOnly';
-    let placementsMap = new Map();
-    try {
-      const { mode, map } = await getPlacementsForVideos(ids, token, { from: PLACEMENTS_WINDOW, to: 'now' });
-      placementsMode = mode;
-      placementsMap = map;
-    } catch (e) {
-      console.error('[placements] failed completely', e.response?.status, e.response?.data || e.message);
-      if (debug) return res.status(206).json({ step: 'placements', status: e.response?.status, body: e.response?.data || e.message });
-    }
+    // Placements (defaults to all-time window)
+    const { mode: placementsMode, map: placementsMap } =
+      await getPlacementsForVideos(ids, token, { from: PLACEMENTS_WINDOW, to: 'now' });
 
-    // Build top-summary
+    // Top summary per video
     const topSummaryByVideo = new Map();
     for (const [vid, rows] of placementsMap.entries()) {
       if (placementsMode === 'full') {
@@ -754,7 +714,7 @@ app.get('/download', async (req, res) => {
     // Workbook
     const wb = new ExcelJS.Workbook();
 
-    // Sheet 1
+    // Sheet 1: Summary — ALL-TIME metrics
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     const summaryHeader = placementsMode === 'full'
       ? `Top Destinations (${PLACEMENTS_WINDOW} · URL · views)`
@@ -776,11 +736,13 @@ app.get('/download', async (req, res) => {
     for (const v of videos) {
       const a = aMap.get(String(v.id)) || {};
       const title = v.name || a.video_name || 'Untitled';
-      const views = a.video_view || 0;
+      const views = a.video_view || 0; // ALL-TIME
 
+      // daily avg from first public timestamp (published_at preferred)
+      const basis = v.published_at || v.created_at;
       let daysSince = 1;
-      if (v.created_at) {
-        const ts = new Date(v.created_at).getTime();
+      if (basis) {
+        const ts = new Date(basis).getTime();
         if (!Number.isNaN(ts)) daysSince = Math.max(1, Math.ceil((now - ts) / 86400000));
       }
       const dailyAvgViews = Number(((views || 0) / daysSince).toFixed(2));
@@ -797,16 +759,16 @@ app.get('/download', async (req, res) => {
         title,
         views,
         dailyAvgViews,
-        impressions: a.video_impression || 0,
-        engagement: a.engagement_score || 0,
-        playRate: a.play_rate || 0,
-        secondsViewed: a.video_seconds_viewed || 0,
+        impressions: a.video_impression || 0,     // ALL-TIME
+        engagement: a.engagement_score || 0,      // ALL-TIME
+        playRate: a.play_rate || 0,               // ALL-TIME
+        secondsViewed: a.video_seconds_viewed || 0, // ALL-TIME
         tags: (v.tags || []).join(', '),
         placementsSummary: placementsCell
       });
     }
 
-    // Sheet 2
+    // Sheet 2: Placements detail
     if (placementsMode === 'full') {
       const wp = wb.addWorksheet('Placements by Video');
       wp.columns = [
@@ -850,7 +812,7 @@ app.get('/download', async (req, res) => {
     }
 
     const buffer = await wb.xlsx.writeBuffer();
-    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_with_placements.xlsx');
+    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Length', buffer.length);
     return res.status(200).end(buffer);
