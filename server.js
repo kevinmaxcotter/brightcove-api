@@ -31,7 +31,14 @@ const splitTerms = input => String(input || '')
   .map(s => s.trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1'))
   .filter(Boolean);
 const esc = s => String(s).replace(/"/g, '\\"');
-const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const stripHtml = s =>
+  String(s).replace(/[&<>\"']/g, m => ({
+    '&': '&amp;',
+    '<': '&lt;',
+    '>': '&gt;',
+    '"': '&quot;',
+    "'": '&#39;'
+  }[m]));
 const titleContainsAll = (video, terms) => {
   const name = (video.name || '').toLowerCase();
   return terms.every(t => name.includes(t.toLowerCase()));
@@ -39,6 +46,10 @@ const titleContainsAll = (video, terms) => {
 const hasAllTags = (video, terms) => {
   const vt = (video.tags || []).map(t => String(t).toLowerCase());
   return terms.every(t => vt.includes(t.toLowerCase()));
+};
+const fmtDate = iso => {
+  const d = new Date(iso);
+  return isNaN(d) ? 'Unknown' : d.toISOString().slice(0, 10);
 };
 
 // ---------------- auth ----------------
@@ -86,6 +97,35 @@ async function fetchVideoById(id, token) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${id}`;
   const r = await axios.get(url, { headers: { Authorization: `Bearer ${token}` } });
   return r.data;
+}
+
+/**
+ * New: Fetch 20 most recent ACTIVE videos (for homepage gallery).
+ */
+async function cmsRecentVideos(token, count = 20) {
+  const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
+  const fields = 'id,name,images,tags,state,created_at';
+  const params = {
+    q: 'state:ACTIVE',
+    fields,
+    sort: '-created_at',
+    limit: count
+  };
+  const r = await axios.get(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    params
+  });
+  const data = Array.isArray(r.data) ? r.data : [];
+  return data
+    .filter(v => v && v.state === 'ACTIVE')
+    .map(v => ({
+      id: v.id,
+      name: v.name || 'Untitled',
+      tags: v.tags || [],
+      created_at: v.created_at,
+      thumb: (v.images && (v.images.thumbnail?.src || v.images.poster?.src)) ||
+             'https://via.placeholder.com/320x180.png?text=No+Thumbnail'
+    }));
 }
 
 // ---------------- unified search (IDs + Tags AND + Title AND) ----------------
@@ -153,7 +193,8 @@ async function unifiedSearch(input, token) {
       id: v.id,
       name: v.name || 'Untitled',
       tags: v.tags || [],
-      thumb: v.images?.thumbnail?.src || v.images?.poster?.src || 'https://via.placeholder.com/320x180.png?text=No+Thumbnail',
+      thumb: (v.images && (v.images.thumbnail?.src || v.images.poster?.src)) ||
+             'https://via.placeholder.com/320x180.png?text=No+Thumbnail',
       created_at: v.created_at
     });
   }
@@ -208,29 +249,75 @@ async function getMetricsForVideo(videoId, token) {
   };
 }
 
-// ---------------- UI: home ----------------
-app.get('/', (req, res) => {
+// ---------------- UI: home (now async & renders recent uploads) ----------------
+app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
+
+  let recent = [];
+  try {
+    const token = await getAccessToken();
+    recent = await cmsRecentVideos(token, 20);
+  } catch (e) {
+    console.error('Recent videos error:', e.response?.data || e.message);
+  }
+
+  // Render four per row using CSS grid
+  const recentCards = recent.map(v => `
+    <a class="r-card" href="/search?q=${encodeURIComponent(v.id)}" title="${stripHtml(v.name)}">
+pHtml(v.thumb)}" alt="${stripHtml(v.name)}" loading="lazy">
+lass="r-title">${stripHtml(v.name)}</div>
+        <div class="r-sub">ID: ${v.id} • ${fmtDate(v.created_at)}</div>
+      </div>
+    </a>
+  `).join('');
+
   res.send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Brightcove Video Tools</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com"Sans:wght@400;600;700p
   <style>
-    body { font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#ffffff; color:#001f3f; margin:0; }
-    header { display:flex; align-items:center; padding:20px; background:#fff; border-bottom:1px solid #e5e7eb; }
+    :root { --navy:#001f3f; --muted:#6b7280; --border:#e5e7eb; --bg:#f8f9fa; }
+    * { box-sizing:border-box; }
+    body { font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif; background:#ffffff; color:var(--navy); margin:0; }
+    header { display:flex; align-items:center; padding:20px; background:#fff; border-bottom:1px solid var(--border); }
     header h1 { margin:0; font-size:1.8rem; font-weight:700; }
-    main { display:flex; justify-content:center; align-items:center; flex-direction:column; padding:40px 20px; }
-    .card { background:#f8f9fa; border:1px solid #e5e7eb; border-radius:12px; padding:24px; max-width:520px; width:100%; box-shadow:0 2px 8px rgba(0,0,0,.05); }
+    main { max-width:1100px; margin:0 auto; padding:24px 16px 48px; }
+    .card { background:var(--bg); border:1px solid var(--border); border-radius:12px; padding:24px; box-shadow:0 2px 8px rgba(0,0,0,.05); }
     h2 { margin:0 0 12px; font-size:1.3rem; }
     label { font-weight:600; display:block; margin:10px 0 6px; }
-    input { width:100%; padding:12px 14px; border:1px solid #c7ccd3; background:#fff; color:#001f3f; border-radius:10px; outline:none; }
+    input[type="text"] { width:100%; padding:12px 14px; border:1px solid #c7ccd3; background:#fff; color:var(--navy); border-radius:10px; outline:none; }
     input::placeholder { color:#6b7280; }
-    .btn { display:inline-block; width:100%; padding:12px 16px; background:#001f3f; color:#fff; border:none; border-radius:10px; cursor:pointer; font-weight:700; margin-top:12px; }
+    .btn { display:inline-block; width:100%; padding:12px 16px; background:var(--navy); color:#fff; border:none; border-radius:10px; cursor:pointer; font-weight:700; margin-top:12px; }
     .btn:hover { background:#003366; }
-    .note { color:#6b7280; font-size:.9rem; margin-top:8px; }
+    .note { color:var(--muted); font-size:.9rem; margin-top:8px; }
+    .spacer { height:28px; }
+
+    /* Recent uploads section */
+    .recent { margin-top:24px; }
+    .recent h3 { margin:0 0 12px; font-size:1.1rem; }
+    .recent-grid {
+      display:grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr)); /* four per row */
+      gap:16px;
+    }
+    @media (max-width: 1100px) { .recent-grid { grid-template-columns: repeat(3, minmax(0,1fr)); } }
+    @media (max-width: 820px)  { .recent-grid { grid-template-columns: repeat(2, minmax(0,1fr)); } }
+    @media (max-width: 520px)  { .recent-grid { grid-template-columns: 1fr; } }
+
+    .r-card {
+      display:block; text-decoration:none; color:inherit;
+      background:#fff; border:1px solid var(--border); border-radius:10px; overflow:hidden;
+      transition: box-shadow .15s ease, transform .15s ease;
+    }
+    .r-card:hover { box-shadow:0 4px 16px rgba(0,0,0,.08); transform: translateY(-2px); }
+    .thumb-wrap { aspect-ratio:16/9; background:#eee; }
+    .thumb-wrap img { width:100%; height:100%; object-fit:cover; display:block; }
+    .r-meta { padding:10px 12px; }
+    .r-title { font-weight:700; font-size:14px; margin:0 0 4px; line-height:1.3; }
+    .r-sub { color:var(--muted); font-size:12px; }
   </style>
 </head>
 <body>
@@ -238,15 +325,23 @@ app.get('/', (req, res) => {
   <main>
     <div class="card">
       <h2>🔍 Search by ID, Tag(s), or Title</h2>
-      <form action="/search" method="get">
-        <label for="q">Enter terms (comma-separated)</label>
+      <form action="/search" for="q">Enter terms (comma-separated)</label>
         <input id="q" name="q" placeholder='Examples: 6376653485112, pega platform, customer decision hub' required />
         <button class="btn" type="submit">Search & Watch</button>
         <div class="note">IDs → exact match. Multiple tags → AND. Titles → must contain all terms.</div>
       </form>
+
+      <div class="spacer"></div>
+
+      <section class="recent">
+        <h3>🆕 20 Most Recent Uploads</h3>
+        <div class="recent-grid">
+          ${recentCards || '<div class="note">No recent videos found.</div>'}
+        </div>
+      </section>
     </div>
   </main>
-  <script>(function(){var v=${JSON.stringify(qPrefill)}; if(v) document.getElementById('q').value=v;})();</script>
+  <script>(function(){var v=\`${qPrefill}\`; if(v) document.getElementById('q').value=v;})();</script>
 </body>
 </html>`);
 });
@@ -271,8 +366,7 @@ app.get('/search', async (req, res) => {
                   title="${stripHtml(v.name)}"></iframe>
           <div class="meta">
             <div class="title">${stripHtml(v.name)}</div>
-            <div class="id">ID: ${v.id}</div>
-            <div class="tags"><strong>Tags:</strong> ${tags || '<em>None</em>'}</div>
+ '<em>None</em>'}</div>
           </div>
         </div>`;
     }).join('');
@@ -282,23 +376,24 @@ app.get('/search', async (req, res) => {
 <head>
   <meta charset="utf-8"/>
   <title>Results for: ${stripHtml(qInput)}</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+lay=swap
   <style>
-    :root{--navy:#001f3f;--muted:#6b7280;--chip:#eef2f7;--chipBorder:#c7ccd3}
+    :root{--navy:#001f3f;--muted:#6b7280;--chip:#eef2f7;--chipBorder:#c7ccd3;--border:#e5e7eb;--bg:#f8f9fa}
     *{box-sizing:border-box}
     body{font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#fff;color:var(--navy);margin:0}
-    header{display:flex;align-items:center;padding:20px;border-bottom:1px solid #e5e7eb;max-width:980px;margin:0 auto}
+    header{display:flex;align-items:center;padding:20px;border-bottom:1px solid var(--border);max-width:1100px;margin:0 auto}
     header h1{margin:0;font-size:1.2rem}
-    main{max-width:980px;margin:20px auto;padding:0 20px}
-    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+    main{max-width:1100px;margin:20px auto;padding:0 16px}
+    .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px;gap:12px;flex-wrap:wrap}
     a.back{color:#0b63ce;text-decoration:none}
     a.back:hover{text-decoration:underline}
     .btn-dl{display:inline-block;padding:10px 14px;background:#001f3f;color:#fff;border-radius:10px;text-decoration:none;font-weight:700}
     .btn-dl:hover{background:#003366}
-    .card{background:#f8f9fa;border:1px solid #e5e7eb;border-radius:12px;padding:24px}
+    .card{background:var(--bg);border:1px solid var(--border);border-radius:12px;padding:24px}
     .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:18px;margin-top:12px}
-    .vcard{background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
+    .vcard{background:#fff;border:1px solid var(--border);border-radius:10px;overflow:hidden}
     .vcard iframe{width:100%;aspect-ratio:16/9;border:0}
     .meta{padding:12px 14px}
     .title{font-weight:700;font-size:15px;margin-bottom:4px}
@@ -313,9 +408,7 @@ app.get('/search', async (req, res) => {
   <main>
     <div class="topbar">
       <a class="back" href="/?q=${encodeURIComponent(qInput)}">← Back to search</a>
-      <a class="btn-dl" href="${downloadUrl}">Download Video Analytics Spreadsheet</a>
-    </div>
-    <div class="card">
+href="${downloadUrl}">Download Video Analytics Spreadsheetlass="card">
       <div class="grid">
         ${cards || '<div>No videos found.</div>'}
       </div>
@@ -355,8 +448,8 @@ app.get('/download', async (req, res) => {
 
     for (const v of videos) {
       try {
-        const token = await getAccessToken();
-        const row = await getMetricsForVideo(v.id, token);
+        const token2 = await getAccessToken();
+        const row = await getMetricsForVideo(v.id, token2);
         ws.addRow({ ...row, tags: (row.tags || []).join(', ') });
       } catch (e) {
         console.error(`Metrics error for ${v.id}:`, e.response?.data || e.message);
