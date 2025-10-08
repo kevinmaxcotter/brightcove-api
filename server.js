@@ -1,4 +1,4 @@
-// server.js — Resilient Search + Auto Placements Fallback + Light/Dark + Recent Uploads
+// server.js — Show ALL tag matches + Resilient Search + Auto Placements Fallback
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -23,13 +23,20 @@ if (missing.length) {
 // ---- CONFIG ----
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
-const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
-const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime'; // e.g. "-90d" or "alltime"
 
-// Paging/safety knobs for CMS search
-const CMS_PAGE_LIMIT = 100;       // per page (Brightcove max 100)
-const CMS_MAX_PAGES = 5;          // hard cap pages per query
-const CMS_TIME_BUDGET_MS = 8000;  // budget for a multi-page query
+// Recent uploads shown on home
+const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
+
+// Analytics placements window (e.g. "-90d" or "alltime")
+const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime';
+
+// CMS paging knobs
+const CMS_PAGE_LIMIT = 100;                  // Brightcove max
+const CMS_HARD_CAP_ALLPAGES = Number(process.env.CMS_HARD_CAP_ALLPAGES || 20000); // big safety rail
+
+// Title-search safety knobs (do NOT affect tag search)
+const NAME_MAX_PAGES = Number(process.env.NAME_MAX_PAGES || 5);
+const NAME_TIME_BUDGET_MS = Number(process.env.NAME_TIME_BUDGET_MS || 8000);
 
 // ---- MIDDLEWARE ----
 app.use(express.urlencoded({ extended: true }));
@@ -92,14 +99,6 @@ const splitTerms = input => String(input || '')
   .filter(Boolean);
 const esc = s => String(s).replace(/"/g, '\\"');
 const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
-const titleContainsAll = (video, terms) => {
-  const name = (video.name || '').toLowerCase();
-  return terms.every(t => name.includes(t.toLowerCase()));
-};
-const hasAllTags = (video, terms) => {
-  const vt = (video.tags || []).map(t => String(t).toLowerCase());
-  return terms.every(t => vt.includes(t.toLowerCase()));
-};
 
 // ---- CMS HELPERS ----
 async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = '-created_at' } = {}) {
@@ -114,19 +113,32 @@ async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = 
   return data || [];
 }
 
-async function fetchAllPages(q, token) {
+// Fetch ALL pages for a query (used for tag searches so you get EVERYTHING)
+async function fetchAllPagesUnlimited(q, token) {
+  const out = [];
+  let offset = 0;
+  while (true) {
+    const batch = await cmsSearch(q, token, { offset });
+    out.push(...batch);
+    if (batch.length < CMS_PAGE_LIMIT) break;
+    offset += CMS_PAGE_LIMIT;
+    if (out.length >= CMS_HARD_CAP_ALLPAGES) break; // very large safety ceiling
+  }
+  return out;
+}
+
+// Fetch pages with a conservative budget (used for *title* queries only)
+async function fetchAllPagesCapped(q, token) {
   const out = [];
   let offset = 0;
   let page = 0;
   const start = Date.now();
-
-  while (page < CMS_MAX_PAGES && (Date.now() - start) < CMS_TIME_BUDGET_MS) {
+  while (page < NAME_MAX_PAGES && (Date.now() - start) < NAME_TIME_BUDGET_MS) {
     const batch = await cmsSearch(q, token, { offset });
     out.push(...batch);
     if (batch.length < CMS_PAGE_LIMIT) break;
     offset += CMS_PAGE_LIMIT;
     page += 1;
-    if (out.length > 2000) break; // extra safety
   }
   return out;
 }
@@ -151,46 +163,60 @@ async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
   }));
 }
 
-// ---- UNIFIED SEARCH (resilient) ----
+// ---- UNIFIED SEARCH (now guarantees FULL tag coverage) ----
+/*
+Behavior:
+- If any numeric IDs are present → fetch those exact videos.
+- For the remaining non-ID terms:
+  * Treat them as **tags** (AND). We do a single CMS query:
+      q = state:ACTIVE tags:"term1" tags:"term2" ...
+    and fetch **ALL pages** (unlimited) so you get *every* match.
+  * We optionally run *title contains* queries (one per term) with a safe cap,
+    then **union** them in (never removing tag matches).
+- De-dupe and sort newest first.
+*/
 async function unifiedSearch(input, token) {
   const terms = splitTerms(input);
   if (!terms.length) return [];
 
   const idTerms = terms.filter(looksLikeId);
-  const nonIds  = terms.filter(t => !looksLikeId(t));
+  const tagTerms = terms.filter(t => !looksLikeId(t));
 
   const pool = [];
 
-  // 1) IDs (independent; tolerate per-ID failures)
+  // IDs
   const idFetches = idTerms.map(id =>
     fetchVideoById(id, token)
       .then(v => { if (v && v.state === 'ACTIVE') pool.push(v); })
-      .catch(() => {}) // ignore bad IDs
+      .catch(() => {})
   );
 
-  // 2) Tags AND (single query)
-  const tagQuery = nonIds.length
-    ? ['state:ACTIVE', ...nonIds.map(t => `tags:"${esc(t)}"`)].join(' ')
-    : null;
+  // TAGS (AND): fetch **ALL** pages — this is the authoritative set
+  let tagMatches = [];
+  if (tagTerms.length) {
+    const qTags = ['state:ACTIVE', ...tagTerms.map(t => `tags:"${esc(t)}"`)].join(' ');
+    try {
+      tagMatches = await fetchAllPagesUnlimited(qTags, token);
+      pool.push(...tagMatches);
+    } catch (e) {
+      console.error('[tags] fetch failed', e.response?.status, e.response?.data || e.message);
+    }
+  }
 
-  // 3) Title contains (union queries)
-  const nameQueries = nonIds.map(t => `state:ACTIVE name:*${esc(t)}*`);
+  // TITLE contains (optional boosters; capped)
+  const titlePromises = tagTerms.map(t => {
+    const qName = `state:ACTIVE name:*${esc(t)}*`;
+    return fetchAllPagesCapped(qName, token)
+      .then(rows => pool.push(...rows))
+      .catch(e => console.error('[title] fetch failed', e.response?.status, e.response?.data || e.message));
+  });
 
-  const searchPromises = [
-    ...idFetches,
-    tagQuery ? fetchAllPages(tagQuery, token).then(rows => pool.push(...rows)).catch(e => console.error('[tags] search failed', e.message)) : Promise.resolve(),
-    ...nameQueries.map(q => fetchAllPages(q, token).then(rows => pool.push(...rows)).catch(e => console.error('[name] search failed', e.message)))
-  ];
-
-  await Promise.allSettled(searchPromises);
-
-  // Local filter for non-ID terms
-  const filtered = nonIds.length ? pool.filter(v => hasAllTags(v, nonIds) || titleContainsAll(v, nonIds)) : pool;
+  await Promise.allSettled([...idFetches, ...titlePromises]);
 
   // De-dupe + normalize
   const seen = new Set();
   const list = [];
-  for (const v of filtered) {
+  for (const v of pool) {
     if (!v || !v.id || v.state !== 'ACTIVE' || seen.has(v.id)) continue;
     seen.add(v.id);
     list.push({
@@ -245,12 +271,9 @@ async function getAnalyticsForVideos(videoIds, token) {
 }
 
 // ---- PLACEMENTS (auto-detect capability; full or player-only) ----
-// cache capability per process
 let DEST_CAPABILITY = null; // 'full' | 'playerOnly'
 async function detectDestinationCapability(token) {
   if (DEST_CAPABILITY) return DEST_CAPABILITY;
-
-  // Try a tiny probe using destination dimensions
   const endpoint = 'https://analytics.api.brightcove.com/v1/data';
   const params = new URLSearchParams({
     accounts: AID,
@@ -267,16 +290,13 @@ async function detectDestinationCapability(token) {
     });
     DEST_CAPABILITY = 'full';
   } catch (e) {
-    const s = e.response?.status;
-    const msg = e.response?.data || e.message;
-    console.warn('[capability] destination dims not available:', s, msg);
+    console.warn('[capability] destination dims not available:', e.response?.status, e.response?.data || e.message);
     DEST_CAPABILITY = 'playerOnly';
   }
   return DEST_CAPABILITY;
 }
 
 async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDOW, to = 'now' } = {}) {
-  // Returns { mode: 'full'|'playerOnly', map: Map<videoId, Array<row>> }
   if (!Array.isArray(videoIds) || videoIds.length === 0) return { mode: 'playerOnly', map: new Map() };
 
   const mode = await detectDestinationCapability(token);
@@ -288,21 +308,13 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
   const resultMap = new Map();
 
   for (const batch of chunks) {
-    const base = {
-      accounts: AID,
-      from,
-      to,
-      where: `video==${batch.join(',')}`
-    };
-
-    let dimensions, fields;
-    if (mode === 'full') {
-      dimensions = 'video,player,destination_domain,destination_path';
-      fields = 'video,player,destination_domain,destination_path,video_view';
-    } else {
-      dimensions = 'video,player';
-      fields = 'video,player,video_view';
-    }
+    const base = { accounts: AID, from, to, where: `video==${batch.join(',')}` };
+    const dimensions = mode === 'full'
+      ? 'video,player,destination_domain,destination_path'
+      : 'video,player';
+    const fields = mode === 'full'
+      ? 'video,player,destination_domain,destination_path,video_view'
+      : 'video,player,video_view';
 
     const params = new URLSearchParams({ ...base, dimensions, fields });
 
@@ -337,9 +349,8 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
     }
   }
 
-  // sort each list by views desc and compact
+  // compact + sort
   for (const [vid, rows] of resultMap.entries()) {
-    // combine duplicates (same player/url)
     if (DEST_CAPABILITY === 'full') {
       const keyMap = new Map();
       for (const r of rows) {
@@ -558,7 +569,6 @@ app.get('/', async (req, res) => {
 </html>`);
   } catch (e) {
     console.error('Home error:', e.response?.status, e.response?.data || e.message);
-    // Friendly fallback to avoid upstream 502s
     res.status(200).send(`<!doctype html><meta charset="utf-8"><title>Brightcove Video Tools</title>
       ${themeHead()}<body style="font-family:system-ui;padding:24px;color:var(--text);background:var(--bg)">
       <h1>Brightcove Video Tools</h1>
@@ -578,19 +588,8 @@ app.get('/search', async (req, res) => {
 
   try {
     const token  = await getAccessToken();
-
-    // Hard time budget for the whole search path
-    const timer = setTimeout(() => console.warn('[search] time budget exceeded'), 20000);
-
-    let videos = [];
-    try {
-      videos = await unifiedSearch(qInput, token);
-    } catch (e) {
-      console.error('[search] unifiedSearch failed', e.response?.status, e.response?.data || e.message);
-      videos = [];
-    } finally {
-      clearTimeout(timer);
-    }
+    const videos = await unifiedSearch(qInput, token);
+    const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
 
     const cards = (videos || []).map(v => {
       const tags = (v.tags || []).map(t => `<span class="tag">${stripHtml(t)}</span>`).join('');
@@ -606,8 +605,6 @@ app.get('/search', async (req, res) => {
           </div>
         </div>`;
     }).join('');
-
-    const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
 
     res.status(200).send(`<!doctype html>
 <html>
@@ -626,11 +623,11 @@ app.get('/search', async (req, res) => {
   <main>
     <div class="topbar">
       <a href="/?q=${encodeURIComponent(qInput)}">← Back to search</a>
-      <a class="btn-dl" href="${downloadUrl}">Download Video Analytics Spreadsheet</a>
+      <a class="btn-dl" href="/download?q=${encodeURIComponent(qInput)}">Download Video Analytics Spreadsheet</a>
     </div>
     <div class="card">
       ${videos && videos.length ? '<div class="grid">' + cards + '</div>' : `
-        <div class="note">No videos found or Brightcove search is busy. Try refining your terms.</div>
+        <div class="note">No videos found for that query.</div>
       `}
     </div>
   </main>
@@ -646,7 +643,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- SPREADSHEET EXPORT (auto fallback; writeBuffer; debug) ----
+// ---- ANALYTICS + PLACEMENTS EXPORT (auto fallback) ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   const debug = req.query.debug === '1';
@@ -670,7 +667,7 @@ app.get('/download', async (req, res) => {
     const aMap = new Map();
     for (const item of analytics) aMap.set(String(item.video), item);
 
-    // Placements (auto-detect mode)
+    // Placements (auto-detect)
     let placementsMode = 'playerOnly';
     let placementsMap = new Map();
     try {
@@ -682,30 +679,20 @@ app.get('/download', async (req, res) => {
       if (debug) return res.status(206).json({ step: 'placements', status: e.response?.status, body: e.response?.data || e.message });
     }
 
-    // Build Top summary (URLs in full mode; players in fallback)
+    // Build top-summary
     const topSummaryByVideo = new Map();
     for (const [vid, rows] of placementsMap.entries()) {
       if (placementsMode === 'full') {
         const byUrl = new Map();
-        for (const r of rows) {
-          const cur = byUrl.get(r.url) || 0;
-          byUrl.set(r.url, cur + (r.views || 0));
-        }
-        const top = Array.from(byUrl.entries())
-          .map(([url, views]) => ({ url, views }))
-          .sort((a, b) => b.views - a.views)
-          .slice(0, 5);
+        for (const r of rows) byUrl.set(r.url, (byUrl.get(r.url) || 0) + (r.views || 0));
+        const top = Array.from(byUrl.entries()).map(([url, views]) => ({ url, views }))
+          .sort((a, b) => b.views - a.views).slice(0, 5);
         topSummaryByVideo.set(String(vid), top);
       } else {
         const byPlayer = new Map();
-        for (const r of rows) {
-          const cur = byPlayer.get(r.player) || 0;
-          byPlayer.set(r.player, cur + (r.views || 0));
-        }
-        const top = Array.from(byPlayer.entries())
-          .map(([player, views]) => ({ player, views }))
-          .sort((a, b) => b.views - a.views)
-          .slice(0, 5);
+        for (const r of rows) byPlayer.set(r.player, (byPlayer.get(r.player) || 0) + (r.views || 0));
+        const top = Array.from(byPlayer.entries()).map(([player, views]) => ({ player, views }))
+          .sort((a, b) => b.views - a.views).slice(0, 5);
         topSummaryByVideo.set(String(vid), top);
       }
     }
@@ -713,12 +700,11 @@ app.get('/download', async (req, res) => {
     // Workbook
     const wb = new ExcelJS.Workbook();
 
-    // Sheet 1: Summary metrics
+    // Sheet 1
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     const summaryHeader = placementsMode === 'full'
       ? `Top Destinations (${PLACEMENTS_WINDOW} · URL · views)`
       : `Top Players (${PLACEMENTS_WINDOW} · playerId · views)`;
-
     ws.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
       { header: 'Title', key: 'title', width: 40 },
@@ -766,7 +752,7 @@ app.get('/download', async (req, res) => {
       });
     }
 
-    // Sheet 2: Detailed placements
+    // Sheet 2
     if (placementsMode === 'full') {
       const wp = wb.addWorksheet('Placements by Video');
       wp.columns = [
@@ -809,7 +795,6 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    // Send as buffer
     const buffer = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_with_placements.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
