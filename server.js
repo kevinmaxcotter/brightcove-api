@@ -1,14 +1,5 @@
-// server.js — Brightcove tools with Analytics-based embed URL discovery
-// Features:
-// - Home: search form + most recent uploads
-// - Results: playable cards, tags, download button
-// - Spreadsheet: all-time metrics + "Embedded On (URLs)" via Analytics destination_domain/path
-// - Light/Dark toggle with emojis
-// - /healthz for Render health checks
-//
-// Notes:
-// - No sitemap/JS crawling (more reliable and faster).
-// - If required env vars are missing, app still boots and shows a banner.
+// server.js — Brightcove tools with Analytics-based embed URLs (all-time)
+// Stable Excel export (addWorksheet + stream), unchanged UI/theme/search.
 
 require('dotenv').config();
 const express = require('express');
@@ -27,9 +18,7 @@ process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION:', err?
 /* ---------- env checks ---------- */
 const MUST = ['BRIGHTCOVE_ACCOUNT_ID','BRIGHTCOVE_CLIENT_ID','BRIGHTCOVE_CLIENT_SECRET','BRIGHTCOVE_PLAYER_ID'];
 const missing = MUST.filter(k => !process.env[k]);
-if (missing.length) {
-  console.error('Missing .env keys:', missing.join(', ')); // keep running; show banner in UI
-}
+if (missing.length) console.error('Missing .env keys:', missing.join(', '));
 
 /* ---------- config ---------- */
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID || '';
@@ -244,7 +233,6 @@ async function getAnalyticsForVideo(videoId, token) {
 }
 
 /* ---------- NEW: embed URLs from Analytics (all-time) ---------- */
-// Returns a Set of full page URLs (https://domain/path) where the video recorded views (all-time)
 async function getEmbedUrlsFromAnalytics(videoId, token) {
   const base = 'https://analytics.api.brightcove.com/v1/data';
   const params = new URLSearchParams({
@@ -269,7 +257,6 @@ async function getEmbedUrlsFromAnalytics(videoId, token) {
     if (!dom) continue;
     if (!path) path = '/';
     if (!path.startsWith('/')) path = '/' + path;
-    // Filter to https since most pages are https; if you need http, change below.
     out.add(`https://${dom}${path}`);
   }
   return out;
@@ -323,8 +310,9 @@ app.get('/healthz', (_req, res) => res.send('ok'));
 app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
 
-  // show banner if missing envs
-  const warn = missing.length ? `<div style="background:#ffefef;border:1px solid #f5b5b5;padding:10px;border-radius:8px;color:#8b0000;margin-bottom:10px">Missing .env keys: ${missing.join(', ')}</div>` : '';
+  const warn = missing.length
+    ? `<div style="background:#ffefef;border:1px solid #f5b5b5;padding:10px;border-radius:8px;color:#8b0000;margin-bottom:10px">Missing .env keys: ${missing.join(', ')}</div>`
+    : '';
 
   let recentHTML = '';
   try {
@@ -435,7 +423,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Download (analytics + embed URLs from Analytics) ---------- */
+/* ---------- Download (all-time analytics + embed URLs from Analytics) ---------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -464,6 +452,7 @@ app.get('/download', async (req, res) => {
           await sleep(300);
           try { rows[i] = await getAnalyticsForVideo(v.id, token); }
           catch (e2) {
+            console.error('metrics error for', v.id, e2?.response?.data || e2.message);
             rows[i] = { id: v.id, title: v.name || 'Error', tags: v.tags||[], views:'N/A', dailyAvgViews:'N/A', impressions:'N/A', engagement:'N/A', playRate:'N/A', secondsViewed:'N/A' };
           }
         }
@@ -491,7 +480,7 @@ app.get('/download', async (req, res) => {
           const urls = await getEmbedUrlsFromAnalytics(v.id, token);
           embedsMap.set(String(v.id), urls);
         } catch (e) {
-          console.error('Embed analytics error for', v.id, e?.response?.data || e.message);
+          console.error('embed urls error for', v.id, e?.response?.data || e.message);
           embedsMap.set(String(v.id), new Set());
         }
       }
@@ -500,9 +489,7 @@ app.get('/download', async (req, res) => {
 
     // ---- build workbook ----
     const wb = new ExcelJS.Workbook();
-    const ws = new ExcelJS.Worksheet(wb, 'Video Metrics (All-Time)');
-    wb.addWorksheet(ws); // ensure consistent API in some ExcelJS versions
-
+    const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
       { header: 'Title', key: 'title', width: 40 },
@@ -537,7 +524,7 @@ app.get('/download', async (req, res) => {
       });
     }
 
-    // optional second sheet listing one URL per row
+    // Optional sheet with one URL per row for easy filtering
     const wf = wb.addWorksheet('Embeds Found');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -550,14 +537,13 @@ app.get('/download', async (req, res) => {
       wf.addRow({ id:'INFO', url:'No embed URLs returned by Analytics for selected videos (all-time).' });
     }
 
-    // stream workbook
-    const buf = await wb.xlsx.writeBuffer();
+    // ---- stream to client (safer across ExcelJS versions) ----
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Length', buf.byteLength);
-    return res.end(Buffer.from(buf));
+    await wb.xlsx.write(res);
+    res.end();
   } catch (err) {
-    console.error('Download error:', err?.response?.status, err?.response?.data || err.message);
+    console.error('Download error (top-level):', err?.response?.status, err?.response?.data || err.message);
     res.status(500).send('Error generating spreadsheet.');
   }
 });
