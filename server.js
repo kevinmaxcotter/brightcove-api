@@ -1,4 +1,4 @@
-// server.js — Light/Dark + Recent Uploads + Destinations in Spreadsheet
+// server.js — Light/Dark + Recent Uploads + Per-Video Placements (player + URL)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -23,7 +23,8 @@ if (missing.length) {
 // ---- CONFIG ----
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
-const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9); // count for "Most Recent Uploads"
+const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);      // recent uploads count on home
+const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime'; // e.g. "-90d" or "alltime"
 
 // ---- MIDDLEWARE ----
 app.use(express.urlencoded({ extended: true }));
@@ -219,24 +220,22 @@ async function getAnalyticsForVideos(videoIds, token) {
   return out;
 }
 
-// ---- DESTINATIONS (domain + path -> protocol-relative URL) ----
-async function getDestinationsForVideos(videoIds, token, { from = 'alltime', to = 'now', topN = 5 } = {}) {
+// ---- PLACEMENTS (per videoId: player + destination_domain/path) ----
+async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDOW, to = 'now' } = {}) {
+  // Returns Map<videoId, Array<{ player, domain, path, url, views }>>
   if (!Array.isArray(videoIds) || videoIds.length === 0) return new Map();
 
-  // chunking
+  const endpoint = 'https://analytics.api.brightcove.com/v1/data';
+  const fields = ['video', 'player', 'destination_domain', 'destination_path', 'video_view'].join(',');
   const chunks = [];
   for (let i = 0; i < videoIds.length; i += 100) chunks.push(videoIds.slice(i, i + 100));
 
-  const endpoint = 'https://analytics.api.brightcove.com/v1/data';
-  const fields = ['video', 'destination_domain', 'destination_path', 'video_view'].join(',');
-
-  // Map<videoId, Map<url, {views, domain, path}>>
-  const accum = new Map();
+  const accum = new Map(); // Map<vid, Map<player|url key, {player, domain, path, url, views}>>
 
   for (const batch of chunks) {
     const params = new URLSearchParams({
       accounts: AID,
-      dimensions: 'video,destination_domain,destination_path',
+      dimensions: 'video,player,destination_domain,destination_path',
       fields,
       from,
       to,
@@ -246,24 +245,25 @@ async function getDestinationsForVideos(videoIds, token, { from = 'alltime', to 
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const { data } = await axiosInstance.get(`${endpoint}?${params.toString()}`, {
-          headers: { Authorization: `Bearer ${token}` },
-          timeout: 30000
+          headers: { Authorization: `Bearer ${token}` }
         });
 
         const items = (data && data.items) || [];
         for (const row of items) {
           const vid = String(row.video);
+          const player = (row.player || '').trim(); // Brightcove Player ID used
           const domain = (row.destination_domain || '').trim();
           const path = (row.destination_path || '').trim();
           const url = domain ? `//${domain}${path.startsWith('/') ? path : (path ? '/' + path : '')}` : '(unknown)';
           const views = row.video_view || 0;
 
           if (!accum.has(vid)) accum.set(vid, new Map());
-          const cur = accum.get(vid).get(url) || { views: 0, domain, path };
+          const key = `${player}|${url}`;
+          const cur = accum.get(vid).get(key) || { player, domain, path, url, views: 0 };
           cur.views += views;
-          accum.get(vid).set(url, cur);
+          accum.get(vid).set(key, cur);
         }
-        break; // success
+        break;
       } catch (err) {
         const s = err.response?.status;
         if (attempt < 2 && (s === 429 || (s >= 500 && s < 600))) {
@@ -275,13 +275,9 @@ async function getDestinationsForVideos(videoIds, token, { from = 'alltime', to 
     }
   }
 
-  // Map<videoId, Array<{url, domain, path, views}>> sorted & limited
   const finalMap = new Map();
-  for (const [vid, urlMap] of accum.entries()) {
-    const rows = Array.from(urlMap.entries())
-      .map(([url, obj]) => ({ url, ...obj }))
-      .sort((a, b) => b.views - a.views)
-      .slice(0, topN);
+  for (const [vid, inner] of accum.entries()) {
+    const rows = Array.from(inner.values()).sort((a, b) => b.views - a.views);
     finalMap.set(vid, rows);
   }
   return finalMap;
@@ -539,7 +535,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- SPREADSHEET EXPORT (with full Destinations data) ----
+// ---- SPREADSHEET EXPORT (Metrics + Top Destinations + Full Placements sheet) ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -551,16 +547,36 @@ app.get('/download', async (req, res) => {
 
     const ids = videos.map(v => v.id);
     const analytics = await getAnalyticsForVideos(ids, token);
-    const destinationsMap = await getDestinationsForVideos(ids, token, {
-      from: 'alltime', // or '-90d'
-      to: 'now',
-      topN: 5
+
+    // Top Destinations (combine domain + path for readability, grouped per video)
+    // Reusing placements fetch, but we'll also map top URLs per video for Sheet 1 display
+    const placementsMap = await getPlacementsForVideos(ids, token, {
+      from: PLACEMENTS_WINDOW,
+      to: 'now'
     });
 
+    // Build a simple "top destinations" view per video from placements
+    const topDestByVideo = new Map();
+    for (const [vid, rows] of placementsMap.entries()) {
+      const byUrl = new Map();
+      for (const r of rows) {
+        const cur = byUrl.get(r.url) || 0;
+        byUrl.set(r.url, cur + (r.views || 0));
+      }
+      const top = Array.from(byUrl.entries())
+        .map(([url, views]) => ({ url, views }))
+        .sort((a, b) => b.views - a.views)
+        .slice(0, 5);
+      topDestByVideo.set(String(vid), top);
+    }
+
+    // Map analytics by ID
     const aMap = new Map();
     for (const item of analytics) aMap.set(String(item.video), item);
 
     const wb = new ExcelJS.Workbook();
+
+    // Sheet 1: Summary metrics
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -572,20 +588,15 @@ app.get('/download', async (req, res) => {
       { header: 'Play Rate', key: 'playRate', width: 12 },
       { header: 'Seconds Viewed', key: 'secondsViewed', width: 18 },
       { header: 'Tags', key: 'tags', width: 40 },
-      { header: 'Top Destinations (URL · views)', key: 'destinations', width: 60 },
-      { header: 'Destination Domains', key: 'domains', width: 40 },
-      { header: 'Destination Paths', key: 'paths', width: 40 },
+      { header: `Top Destinations (${PLACEMENTS_WINDOW} · URL · views)`, key: 'destinations', width: 70 },
     ];
 
     const now = Date.now();
     for (const v of videos) {
       const a = aMap.get(String(v.id)) || {};
       const title = v.name || a.video_name || 'Untitled';
-
-      // Prefer analytics video_view as all-time proxy here
       const views = a.video_view || 0;
 
-      // daily avg based on created_at
       let daysSince = 1;
       if (v.created_at) {
         const ts = new Date(v.created_at).getTime();
@@ -593,12 +604,10 @@ app.get('/download', async (req, res) => {
       }
       const dailyAvgViews = Number(((views || 0) / daysSince).toFixed(2));
 
-      const destRows = destinationsMap.get(String(v.id)) || [];
-      const destinationsCell = destRows.length
-        ? destRows.map(d => `${d.url} · ${d.views}`).join('; ')
+      const topDest = topDestByVideo.get(String(v.id)) || [];
+      const destinationsCell = topDest.length
+        ? topDest.map(d => `${d.url} · ${d.views}`).join('; ')
         : '—';
-      const domainsCell = destRows.length ? destRows.map(d => d.domain || '(none)').join('; ') : '—';
-      const pathsCell = destRows.length ? destRows.map(d => d.path || '(none)').join('; ') : '—';
 
       ws.addRow({
         id: v.id,
@@ -610,13 +619,36 @@ app.get('/download', async (req, res) => {
         playRate: a.play_rate || 0,
         secondsViewed: a.video_seconds_viewed || 0,
         tags: (v.tags || []).join(', '),
-        destinations: destinationsCell,
-        domains: domainsCell,
-        paths: pathsCell
+        destinations: destinationsCell
       });
     }
 
-    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
+    // Sheet 2: Per-video placements (one row per player+page)
+    const wp = wb.addWorksheet('Placements by Video');
+    wp.columns = [
+      { header: 'Video ID', key: 'video', width: 20 },
+      { header: 'Player ID', key: 'player', width: 28 },
+      { header: 'Destination Domain', key: 'domain', width: 34 },
+      { header: 'Destination Path', key: 'path', width: 50 },
+      { header: 'Full URL (protocol-relative)', key: 'url', width: 60 },
+      { header: `Views (${PLACEMENTS_WINDOW})`, key: 'views', width: 18 },
+    ];
+
+    for (const vid of ids) {
+      const rows = placementsMap.get(String(vid)) || [];
+      for (const r of rows) {
+        wp.addRow({
+          video: vid,
+          player: r.player || '(unknown)',
+          domain: r.domain || '(none)',
+          path: r.path || '(none)',
+          url: r.url,
+          views: r.views || 0
+        });
+      }
+    }
+
+    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_with_placements.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     await wb.xlsx.write(res);
     res.end();
