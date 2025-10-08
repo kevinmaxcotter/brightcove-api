@@ -1,4 +1,4 @@
-// server.js — Show ALL tag matches + Resilient Search + Auto Placements Fallback
+// server.js — Precise Tag/Title/ID search (returns ALL tag matches) + Light/Dark + Recent Uploads + Robust Export
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -24,14 +24,17 @@ if (missing.length) {
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 
-// Recent uploads shown on home
+// Recent uploads on home
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 
 // Analytics placements window (e.g. "-90d" or "alltime")
 const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime';
 
+// Search scope
+const SEARCH_ACTIVE_ONLY = String(process.env.SEARCH_ACTIVE_ONLY || 'false').toLowerCase() === 'true';
+
 // CMS paging knobs
-const CMS_PAGE_LIMIT = 100;                  // Brightcove max
+const CMS_PAGE_LIMIT = 100;                           // Brightcove max
 const CMS_HARD_CAP_ALLPAGES = Number(process.env.CMS_HARD_CAP_ALLPAGES || 20000); // big safety rail
 
 // Title-search safety knobs (do NOT affect tag search)
@@ -92,13 +95,50 @@ async function getAccessToken() {
 }
 
 // ---- UTILS ----
-const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
-const splitTerms = input => String(input || '')
-  .split(',')
-  .map(s => s.trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1'))
-  .filter(Boolean);
-const esc = s => String(s).replace(/"/g, '\\"');
 const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
+const esc = s => String(s).replace(/"/g, '\\"');
+
+// Parse comma-separated search string into explicit buckets:
+// - id:1234567890123  OR bare numeric -> ids
+// - tag:foo (quoted allowed)          -> tagTerms
+// - title:bar (quoted allowed)        -> titleTerms
+// - bare tokens -> treated as tags (so "pega platform" == tag:"pega platform")
+function parseQuery(input) {
+  const raw = String(input || '')
+    .split(',')
+    .map(s => s.trim())
+    .filter(Boolean);
+
+  const ids = [];
+  const tagTerms = [];
+  const titleTerms = [];
+
+  for (let tok of raw) {
+    // unquote "..." or '...'
+    tok = tok.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+
+    // explicit prefixes
+    const m = tok.match(/^(id|tag|title)\s*:(.*)$/i);
+    if (m) {
+      const key = m[1].toLowerCase();
+      const val = m[2].trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+      if (!val) continue;
+      if (key === 'id') { if (looksLikeId(val)) ids.push(val); }
+      else if (key === 'tag') { tagTerms.push(val); }
+      else if (key === 'title') { titleTerms.push(val); }
+      continue;
+    }
+
+    // bare numeric -> id
+    if (looksLikeId(tok)) { ids.push(tok); continue; }
+
+    // otherwise treat as a tag token
+    tagTerms.push(tok);
+  }
+
+  return { ids, tagTerms, titleTerms };
+}
 
 // ---- CMS HELPERS ----
 async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = '-created_at' } = {}) {
@@ -113,7 +153,7 @@ async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = 
   return data || [];
 }
 
-// Fetch ALL pages for a query (used for tag searches so you get EVERYTHING)
+// Fetch ALL pages for a query (authoritative for tag searches)
 async function fetchAllPagesUnlimited(q, token) {
   const out = [];
   let offset = 0;
@@ -153,7 +193,8 @@ async function fetchVideoById(id, token) {
 
 // ---- RECENT UPLOADS ----
 async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
-  const list = await cmsSearch('state:ACTIVE', token, { limit, sort: '-created_at', offset: 0 });
+  const scope = SEARCH_ACTIVE_ONLY ? 'state:ACTIVE' : ''; // empty → all states
+  const list = await cmsSearch(scope, token, { limit, sort: '-created_at', offset: 0 });
   return (list || []).map(v => ({
     id: v.id,
     name: v.name || 'Untitled',
@@ -163,61 +204,72 @@ async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
   }));
 }
 
-// ---- UNIFIED SEARCH (now guarantees FULL tag coverage) ----
-/*
-Behavior:
-- If any numeric IDs are present → fetch those exact videos.
-- For the remaining non-ID terms:
-  * Treat them as **tags** (AND). We do a single CMS query:
-      q = state:ACTIVE tags:"term1" tags:"term2" ...
-    and fetch **ALL pages** (unlimited) so you get *every* match.
-  * We optionally run *title contains* queries (one per term) with a safe cap,
-    then **union** them in (never removing tag matches).
-- De-dupe and sort newest first.
-*/
+// ---- UNIFIED SEARCH (ID + TAG + TITLE; full tag coverage) ----
 async function unifiedSearch(input, token) {
-  const terms = splitTerms(input);
-  if (!terms.length) return [];
-
-  const idTerms = terms.filter(looksLikeId);
-  const tagTerms = terms.filter(t => !looksLikeId(t));
+  const { ids, tagTerms, titleTerms } = parseQuery(input);
 
   const pool = [];
 
-  // IDs
-  const idFetches = idTerms.map(id =>
+  // 1) IDs (exact)
+  const idFetches = ids.map(id =>
     fetchVideoById(id, token)
-      .then(v => { if (v && v.state === 'ACTIVE') pool.push(v); })
+      .then(v => { if (v && v.id) pool.push(v); })
       .catch(() => {})
   );
 
-  // TAGS (AND): fetch **ALL** pages — this is the authoritative set
+  // 2) TAGS (AND): authoritative, fetch ALL pages
   let tagMatches = [];
   if (tagTerms.length) {
-    const qTags = ['state:ACTIVE', ...tagTerms.map(t => `tags:"${esc(t)}"`)].join(' ');
+    // Build q: tags:"t1" tags:"t2" ... ; optionally constrain to ACTIVE if env set
+    const parts = [...tagTerms.map(t => `tags:"${esc(t)}"`)];
+    if (SEARCH_ACTIVE_ONLY) parts.unshift('state:ACTIVE'); // else all states
+    const qTags = parts.join(' ');
     try {
       tagMatches = await fetchAllPagesUnlimited(qTags, token);
       pool.push(...tagMatches);
+      console.log(`[search] tag AND q="${qTags}" -> ${tagMatches.length} items`);
     } catch (e) {
-      console.error('[tags] fetch failed', e.response?.status, e.response?.data || e.message);
+      console.error('[search][tags] failed', e.response?.status, e.response?.data || e.message);
     }
   }
 
-  // TITLE contains (optional boosters; capped)
-  const titlePromises = tagTerms.map(t => {
-    const qName = `state:ACTIVE name:*${esc(t)}*`;
-    return fetchAllPagesCapped(qName, token)
-      .then(rows => pool.push(...rows))
-      .catch(e => console.error('[title] fetch failed', e.response?.status, e.response?.data || e.message));
-  });
+  // 3) TITLE (AND): capped
+  if (titleTerms.length) {
+    // One query per term, union results locally, then require AND by filtering
+    const resultsPerTerm = await Promise.allSettled(
+      titleTerms.map(t => {
+        const parts = [`name:*${esc(t)}*`];
+        if (SEARCH_ACTIVE_ONLY) parts.unshift('state:ACTIVE');
+        const qName = parts.join(' ');
+        return fetchAllPagesCapped(qName, token);
+      })
+    );
 
-  await Promise.allSettled([...idFetches, ...titlePromises]);
+    // Union then AND-filter: keep videos that appeared in all term result sets
+    const buckets = resultsPerTerm
+      .map(r => (r.status === 'fulfilled' ? r.value : []))
+      .map(arr => new Map(arr.map(v => [v.id, v])));
+
+    if (buckets.length) {
+      const idCounts = new Map();
+      for (const b of buckets) {
+        for (const id of b.keys()) idCounts.set(id, (idCounts.get(id) || 0) + 1);
+      }
+      const andIds = [...idCounts.entries()].filter(([, c]) => c === buckets.length).map(([id]) => id);
+      const firstBucket = buckets[0];
+      const titleAndMatches = andIds.map(id => firstBucket.get(id)).filter(Boolean);
+      pool.push(...titleAndMatches);
+      console.log(`[search] title AND terms=${JSON.stringify(titleTerms)} -> ${titleAndMatches.length} items`);
+    }
+  }
+
+  await Promise.allSettled(idFetches);
 
   // De-dupe + normalize
   const seen = new Set();
   const list = [];
   for (const v of pool) {
-    if (!v || !v.id || v.state !== 'ACTIVE' || seen.has(v.id)) continue;
+    if (!v || !v.id || seen.has(v.id)) continue;
     seen.add(v.id);
     list.push({
       id: v.id,
@@ -228,7 +280,9 @@ async function unifiedSearch(input, token) {
     });
   }
 
+  // Newest first
   list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
+  console.log(`[search] final unique results: ${list.length}`);
   return list;
 }
 
@@ -551,9 +605,9 @@ app.get('/', async (req, res) => {
       <h2>🔍 Search by ID, Tag(s), or Title</h2>
       <form action="/search" method="get">
         <label for="q">Enter terms (comma-separated)</label>
-        <input id="q" name="q" placeholder='Examples: 6376653485112, pega platform, customer decision hub' required />
+        <input id="q" name="q" placeholder='Examples: id:6376653485112, tag:"pega platform", title:"customer decision hub"' required />
         <button class="btn" type="submit">Search & Watch</button>
-        <div class="topnote">IDs → exact match. Multiple tags → AND. Titles → must contain all terms.</div>
+        <div class="topnote">Use prefixes id:, tag:, title:. Bare terms are treated as tags. Multiple tokens are ANDed per prefix.</div>
       </form>
 
       <div class="section">
@@ -574,7 +628,7 @@ app.get('/', async (req, res) => {
       <h1>Brightcove Video Tools</h1>
       <p>We couldn't load recent uploads right now, but search still works.</p>
       <form action="/search" method="get">
-        <input style="padding:10px;border:1px solid var(--border);background:transparent;color:var(--text);border-radius:8px" name="q" placeholder="Search terms" required />
+        <input style="padding:10px;border:1px solid var(--border);background:transparent;color:var(--text);border-radius:8px" name="q" placeholder='id:..., tag:"...", title:"..."' required />
         <button class="btn" type="submit" style="margin-left:8px">Search</button>
       </form>
       </body>`);
@@ -623,7 +677,7 @@ app.get('/search', async (req, res) => {
   <main>
     <div class="topbar">
       <a href="/?q=${encodeURIComponent(qInput)}">← Back to search</a>
-      <a class="btn-dl" href="/download?q=${encodeURIComponent(qInput)}">Download Video Analytics Spreadsheet</a>
+      <a class="btn-dl" href="${downloadUrl}">Download Video Analytics Spreadsheet</a>
     </div>
     <div class="card">
       ${videos && videos.length ? '<div class="grid">' + cards + '</div>' : `
