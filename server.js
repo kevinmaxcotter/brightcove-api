@@ -7,6 +7,7 @@ const ExcelJS = require('exceljs');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// ---- ENV GUARDRAILS ----
 const MUST = [
   'BRIGHTCOVE_ACCOUNT_ID',
   'BRIGHTCOVE_CLIENT_ID',
@@ -19,16 +20,17 @@ if (missing.length) {
   process.exit(1);
 }
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(express.static('public')); // put pega_logo.png here if you want a logo
-
-// ---------- CONFIG ----------
+// ---- CONFIG ----
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
-const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9); // how many recent uploads to show
+const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9); // count for "Most Recent Uploads"
 
-// ---------- AXIOS + TOKEN CACHE ----------
+// ---- APP MIDDLEWARE / STATIC ----
+app.use(express.urlencoded({ extended: true }));
+app.use(express.json());
+app.use(express.static('public')); // optional assets
+
+// ---- AXIOS + TOKEN CACHE ----
 const http = axios.create({ timeout: 30000 });
 
 let tokenCache = { access_token: null, expires_at: 0 };
@@ -56,14 +58,15 @@ async function getAccessToken() {
   return tokenCache.access_token;
 }
 
-// ---------------- helpers ----------------
+// ---- SMALL UTILS ----
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 const splitTerms = input => String(input || '')
   .split(',')
   .map(s => s.trim().replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1'))
   .filter(Boolean);
 const esc = s => String(s).replace(/"/g, '\\"');
-const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const stripHtml = s =>
+  String(s).replace(/[&<>"']/g, m => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 const titleContainsAll = (video, terms) => {
   const name = (video.name || '').toLowerCase();
   return terms.every(t => name.includes(t.toLowerCase()));
@@ -73,7 +76,7 @@ const hasAllTags = (video, terms) => {
   return terms.every(t => vt.includes(t.toLowerCase()));
 };
 
-// ---------------- CMS helpers ----------------
+// ---- CMS HELPERS ----
 async function cmsSearch(q, token, { limit = 100, offset = 0, sort = '-created_at' } = {}) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
   const fields = 'id,name,images,tags,state,created_at,published_at';
@@ -92,7 +95,7 @@ async function fetchAllPages(q, token) {
     out.push(...batch);
     if (batch.length < 100) break;
     offset += 100;
-    if (out.length > 5000) break; // safety guard
+    if (out.length > 5000) break; // safety
   }
   return out;
 }
@@ -103,12 +106,11 @@ async function fetchVideoById(id, token) {
   return r.data;
 }
 
-// ----------- NEW: Recent uploads -----------
+// ---- NEW: RECENT UPLOADS ----
 async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
-  // Only ACTIVE videos; newest first
+  // Only ACTIVE videos; newest first by created_at
   const q = 'state:ACTIVE';
   const list = await cmsSearch(q, token, { limit, sort: '-created_at', offset: 0 });
-  // normalize small card fields
   return (list || []).map(v => ({
     id: v.id,
     name: v.name || 'Untitled',
@@ -118,48 +120,45 @@ async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
   }));
 }
 
-// ---------------- unified search (IDs + Tags AND + Title AND) ----------------
+// ---- UNIFIED SEARCH (IDs + tags AND + title AND) ----
 async function unifiedSearch(input, token) {
   const terms = splitTerms(input);
   if (!terms.length) return [];
 
   const idTerms = terms.filter(looksLikeId);
-  const nonIds  = terms.filter(t => !looksLikeId(t));
+  const nonIds = terms.filter(t => !looksLikeId(t));
 
   const pool = [];
 
-  // Exact IDs
+  // exact IDs
   for (const id of idTerms) {
     try {
       const v = await fetchVideoById(id, token);
       if (v && v.state === 'ACTIVE') pool.push(v);
-    } catch {}
+    } catch { /* ignore missing */ }
   }
 
-  // Candidates by tags (AND) in one query
-  let byTags = [];
+  // tags AND query
   if (nonIds.length) {
     const qTags = ['state:ACTIVE', ...nonIds.map(t => `tags:"${esc(t)}"`)].join(' ');
-    byTags = await fetchAllPages(qTags, token);
+    const byTags = await fetchAllPages(qTags, token);
     pool.push(...byTags);
   }
 
-  // Candidates by name:*term* for EACH term (union), then locally require titleContainsAll
-  let byNameUnion = [];
+  // title contains all terms: union fetch by name:*term*, then local AND
   for (const t of nonIds) {
     const qName = `state:ACTIVE name:*${esc(t)}*`;
     const chunk = await fetchAllPages(qName, token);
-    byNameUnion.push(...chunk);
+    pool.push(...chunk);
   }
-  pool.push(...byNameUnion);
 
-  // Local filter for non-ID terms:
+  // local filter for non-ID terms
   let filtered = pool;
   if (nonIds.length) {
     filtered = pool.filter(v => hasAllTags(v, nonIds) || titleContainsAll(v, nonIds));
   }
 
-  // De-dupe and normalize
+  // de-dupe and normalize
   const seen = new Set();
   const list = [];
   for (const v of filtered) {
@@ -174,12 +173,12 @@ async function unifiedSearch(input, token) {
     });
   }
 
-  // Newest first
+  // newest first
   list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   return list;
 }
 
-// ---------------- Analytics (batched) for spreadsheet ----------------
+// ---- ANALYTICS (BATCHED) FOR SPREADSHEET ----
 async function getAnalyticsForVideos(videoIds, token) {
   if (!Array.isArray(videoIds) || videoIds.length === 0) return [];
   const endpoint = 'https://analytics.api.brightcove.com/v1/data';
@@ -208,6 +207,7 @@ async function getAnalyticsForVideos(videoIds, token) {
       where: `video==${batch.join(',')}`
     });
 
+    // tiny retry for 429/5xx
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
         const { data } = await http.get(`${endpoint}?${params.toString()}`, {
@@ -234,7 +234,7 @@ async function getAlltimeViews(videoId, token) {
   return data?.alltime_video_views ?? data?.alltime_videos_views ?? 0;
 }
 
-// ---------------- UI: home (with Recent Uploads) ----------------
+// ---- UI: HOME (Search + Most Recent Uploads; NO spreadsheet button here) ----
 app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
 
@@ -285,9 +285,7 @@ app.get('/', async (req, res) => {
     .meta{padding:12px 14px}
     .title{font-weight:700;font-size:15px;margin-bottom:4px}
     .id,.date{color:var(--muted);font-size:12.5px;margin-top:2px}
-    .topnote{color:var(--muted);font-size:12.5px;margin-top:6px}
-    .bar{display:flex;gap:12px;align-items:center}
-    .bar .btn-inline{width:auto;padding:10px 14px}
+    .topnote{color:#6b7280;font-size:12.5px;margin-top:6px}
   </style>
 </head>
 <body>
@@ -298,10 +296,7 @@ app.get('/', async (req, res) => {
       <form action="/search" method="get">
         <label for="q">Enter terms (comma-separated)</label>
         <input id="q" name="q" placeholder='Examples: 6376653485112, pega platform, customer decision hub' required />
-        <div class="bar">
-          <button class="btn btn-inline" type="submit">Search & Watch</button>
-          <a class="btn btn-inline" href="/download?q=" onclick="this.href='/download?q='+encodeURIComponent(document.getElementById('q').value);">Download Spreadsheet for Search</a>
-        </div>
+        <button class="btn" type="submit">Search & Watch</button>
         <div class="topnote">IDs → exact match. Multiple tags → AND. Titles → must contain all terms.</div>
       </form>
 
@@ -318,28 +313,17 @@ app.get('/', async (req, res) => {
 </html>`);
   } catch (e) {
     console.error('Home error:', e.response?.status, e.response?.data || e.message);
-    // fall back to bare search page if recent fails
-    const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
-    res.send(`<!doctype html>
-<html><head><meta charset="utf-8"/><title>Brightcove Video Tools</title></head>
-<body>
-  <h1>Brightcove Video Tools</h1>
-  <form action="/search" method="get">
-    <input id="q" name="q" placeholder='6376653485112, pega platform, ...' required />
-    <button type="submit">Search & Watch</button>
-  </form>
-  <script>(function(){var v=${JSON.stringify(qPrefill)}; if(v) document.getElementById('q').value=v;})();</script>
-</body></html>`);
+    res.status(500).send('Error loading home.');
   }
 });
 
-// ---------------- UI: results ----------------
+// ---- UI: SEARCH RESULTS (Spreadsheet button shown here) ----
 app.get('/search', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.redirect('/');
 
   try {
-    const token  = await getAccessToken();
+    const token = await getAccessToken();
     const videos = await unifiedSearch(qInput, token);
     const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
 
@@ -384,7 +368,7 @@ app.get('/search', async (req, res) => {
     .meta{padding:12px 14px}
     .title{font-weight:700;font-size:15px;margin-bottom:4px}
     .id{color:var(--muted);font-size:13px;margin-bottom:6px}
-    .tag{display:inline-block;margin:4px 6px 0 0;padding:4px 8px;border-radius:999px;background:var(--chip);border:1px solid var(--chipBorder);color:#1f2937;font-size:12px}
+    .tag{display:inline-block;margin:4px 6px 0 0;padding:4px 8px;border-radius:999px;background:var(--chip);border:1px solid --var(chipBorder);color:#1f2937;font-size:12px}
   </style>
 </head>
 <body>
@@ -410,13 +394,13 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---------------- Spreadsheet (metrics for these results) ----------------
+// ---- SPREADSHEET EXPORT ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
 
   try {
-    const token  = await getAccessToken();
+    const token = await getAccessToken();
     const videos = await unifiedSearch(qInput, token);
     if (!videos.length) return res.status(404).send('No videos found for that search.');
 
@@ -427,11 +411,11 @@ app.get('/download', async (req, res) => {
     const aMap = new Map();
     for (const item of analytics) aMap.set(String(item.video), item);
 
-    // Optional: also use alltime endpoint for views (slower but canonical)
+    // Optional: also use alltime endpoint for views (canonical, but slower)
     const USE_ALLTIME_VIEWS = true;
     let viewsMap = new Map();
     if (USE_ALLTIME_VIEWS) {
-      const limit = 6;
+      const limit = 6; // concurrency cap
       let i = 0;
       async function worker() {
         while (i < ids.length) {
@@ -471,7 +455,7 @@ app.get('/download', async (req, res) => {
         ? (viewsMap.get(String(v.id)) ?? a.video_view ?? 0)
         : (a.video_view ?? 0);
 
-      // daily avg approx based on created_at available from search list
+      // daily avg based on created_at available from search list
       let daysSince = 1;
       if (v.created_at) {
         const ts = new Date(v.created_at).getTime();
@@ -502,6 +486,7 @@ app.get('/download', async (req, res) => {
   }
 });
 
+// ---- START ----
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
