@@ -1,11 +1,9 @@
 /* eslint-disable no-console */
 require('dotenv').config();
-
 const express = require('express');
 const axios = require('axios');
 const ExcelJS = require('exceljs');
 const path = require('path');
-
 const app = express();
 const PORT = process.env.PORT || 3000;
 
@@ -23,25 +21,20 @@ if (missingEnv.length) {
 
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(express.static(path.join(__dirname, 'public'), {
-  maxAge: '1h',
-}));
+app.use(express.static(path.join(__dirname, 'public'), { maxAge: '1h' }));
 
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 
-// ---------------- Helpers ----------------
+// --- Helpers ---
 const looksLikeId = (s) => /^\d{9,}$/.test(String(s).trim());
 const splitTerms = (input) =>
   String(input || '')
     .split(',')
     .map((s) => s.trim())
-    // remove wrapping single or double quotes if present
     .map((s) => s.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1'))
     .filter(Boolean);
 
-// Escape only for Brightcove CMS query where we need to put text in quotes
-const escapeForCmsQuery = (s) => String(s).replace(/(["\\])/g, '\\$1');
-
+const escapeForCmsQuery = (s) => String(s).replace(/([\"\\])/g, '\\$1');
 const escapeHtml = (s = '') =>
   String(s).replace(/[&<>"']/g, (m) =>
     ({
@@ -50,27 +43,24 @@ const escapeHtml = (s = '') =>
       '>': '&gt;',
       '"': '&quot;',
       "'": '&#39;',
-    }[m]),
+    }[m])
   );
 
 const titleContainsAll = (video, terms) => {
   const name = (video.name || '').toLowerCase();
   return terms.every((t) => name.includes(String(t).toLowerCase()));
 };
-
 const hasAllTags = (video, terms) => {
   const vt = (video.tags || []).map((t) => String(t).toLowerCase());
   return terms.every((t) => vt.includes(String(t).toLowerCase()));
 };
-
 const fmtDate = (iso) => {
   const d = new Date(iso);
   return Number.isNaN(d.getTime()) ? 'Unknown' : d.toISOString().slice(0, 10);
 };
 
-// ---------------- Auth (token cache) ----------------
+// --- Auth (token cache) ---
 let tokenCache = { token: null, expiresAt: 0 };
-
 async function getAccessToken() {
   const now = Date.now();
   if (tokenCache.token && tokenCache.expiresAt > now) {
@@ -86,7 +76,7 @@ async function getAccessToken() {
       },
       headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
       timeout: 15000,
-    },
+    }
   );
   const token = r.data.access_token;
   const ttl = Math.max(60, (r.data.expires_in || 300) - 30); // 30s safety buffer
@@ -95,11 +85,9 @@ async function getAccessToken() {
 }
 
 // Axios instance (sane defaults)
-const http = axios.create({
-  timeout: 20000,
-});
+const http = axios.create({ timeout: 20000 });
 
-// ---------------- CMS Helpers ----------------
+// --- CMS Helpers ---
 async function cmsSearch(q, token, { limit = 100, offset = 0, sort = '-created_at' } = {}) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
   const fields = 'id,name,images,tags,state,created_at,published_at';
@@ -160,16 +148,13 @@ async function cmsRecentVideos(token, count = 20) {
     }));
 }
 
-// ---------------- Unified Search ----------------
+// --- Unified Search ---
 async function unifiedSearch(input, token) {
   const terms = splitTerms(input);
   if (!terms.length) return [];
-
   const idTerms = terms.filter(looksLikeId);
   const nonIds = terms.filter((t) => !looksLikeId(t));
-
   const pool = [];
-
   // Direct ID fetches (resilient to missing)
   for (const id of idTerms) {
     try {
@@ -179,26 +164,22 @@ async function unifiedSearch(input, token) {
       // ignore missing IDs
     }
   }
-
   // Tag and title searches
   if (nonIds.length) {
     // All non-ID terms as tags
     const qTags = ['state:ACTIVE', ...nonIds.map((t) => `tags:"${escapeForCmsQuery(t)}"`)].join(' ');
     pool.push(...(await fetchAllPages(qTags, token)));
-
     // Each term in name
     for (const t of nonIds) {
       const qName = `state:ACTIVE name:*${escapeForCmsQuery(t)}*`;
       pool.push(...(await fetchAllPages(qName, token)));
     }
   }
-
   // If non-ID terms were used, filter down to items that match *all* terms
   let filtered = pool;
   if (nonIds.length) {
     filtered = pool.filter((v) => hasAllTags(v, nonIds) || titleContainsAll(v, nonIds));
   }
-
   // De-dupe, map, sort by created
   const seen = new Set();
   const list = [];
@@ -216,20 +197,15 @@ async function unifiedSearch(input, token) {
       published_at: v.published_at,
     });
   }
-
   list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   return list;
 }
 
-// ---------------- Analytics ----------------
+// --- Analytics ---
 async function getMetricsForVideo(videoId, token) {
   const alltimeViewsUrl = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${videoId}`;
-
-  // Build analytics with params to let axios handle encoding cleanly.
   const analyticsUrl = 'https://analytics.api.brightcove.com/v1/data';
-
   const infoUrl = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${videoId}`;
-
   const [alltimeResp, metricsResp, infoResp] = await Promise.all([
     http.get(alltimeViewsUrl, { headers: { Authorization: `Bearer ${token}` } }),
     http.get(analyticsUrl, {
@@ -246,21 +222,17 @@ async function getMetricsForVideo(videoId, token) {
     }),
     http.get(infoUrl, { headers: { Authorization: `Bearer ${token}` } }),
   ]);
-
   const title = infoResp.data?.name || 'Untitled';
   const tags = infoResp.data?.tags || [];
   const publishedAt = infoResp.data?.published_at || infoResp.data?.created_at;
-
   const m = metricsResp.data?.items?.[0] || {};
   const alltimeViews = alltimeResp.data?.alltime_video_views ?? 0;
-
   let daysSince = 1;
   if (publishedAt) {
     const ts = new Date(publishedAt).getTime();
     if (!Number.isNaN(ts)) daysSince = Math.max(1, Math.ceil((Date.now() - ts) / 86400000));
   }
   const dailyAvgViews = Number((alltimeViews / daysSince).toFixed(2));
-
   return {
     id: videoId,
     title,
@@ -274,7 +246,7 @@ async function getMetricsForVideo(videoId, token) {
   };
 }
 
-// ---------------- Concurrency helper ----------------
+// --- Concurrency helper ---
 async function mapConcurrent(items, limit, mapper) {
   const results = new Array(items.length);
   let i = 0;
@@ -295,7 +267,7 @@ async function mapConcurrent(items, limit, mapper) {
   return results;
 }
 
-// ---------------- Home Page ----------------
+// --- Home Page ---
 app.get('/', async (req, res) => {
   const qPrefill = String(req.query.q || '').replace(/`/g, '\\`');
   let recent = [];
@@ -305,30 +277,26 @@ app.get('/', async (req, res) => {
   } catch (e) {
     console.error('Recent videos error:', e.message);
   }
-
   const recentCards = recent
     .map(
       (v) => `
-    <a class="r-card" href="/search?q=${}
-      <div class="thumb-wrap">
-        <img src="${escapeHtml(v.thumb)}" alt="${escapeHtml(v.name)}">
-        <div class="r-title">${escapeHtml(v.name)}</div>
-        <div class="r-sub">ID: ${v.id} â€¢ ${fmtDate(v.created_at)}</div>
-      </div>
-    </a>
-  `,
+      <a class="r-card" hrefomponent(v.id)}
+        <div class="thumb-wrap">
+          ${escapeHtml(v.thumb)}
+          <div class="r-title">${escapeHtml(v.name)}</div>
+          <div class="r-sub">ID: ${v.id} • ${fmtDate(v.created_at)}</div>
+        </div>
+      </a>
+    `
     )
     .join('');
-
   res.type('html').send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>Brightcove Video Tools</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <link rel="preconnect" href="https://fontsts.gstatic.com
-  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&displayle>
-    body { font-family:'Open Sans',sans-serif; margin:0; background:#fff; color:#001f3f; }
+  <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel=" { font-family:'Open Sans',sans-serif; margin:0; background:#fff; color:#001f3f; }
     header { padding:20px; border-bottom:1px solid #e5e7eb; }
     header h1 { margin:0; font-size:1.8rem; font-weight:700; }
     main { max-width:1100px; margin:0 auto; padding:24px 16px; }
@@ -342,7 +310,6 @@ app.get('/', async (req, res) => {
     .r-card { display:block; text-decoration:none; color:inherit; border:1px solid #e5e7eb; border-radius:10px; overflow:hidden; background:#fff; }
     .thumb-wrap { aspect-ratio:16/9; background:#eee; }
     .thumb-wrap img { width:100%; height:100%; object-fit:cover; display:block; }
-    .r-meta { padding:10px; }
     .r-title { font-weight:700; font-size:14px; margin-bottom:4px; }
     .r-sub { font-size:12px; color:#6b7280; }
   </style>
@@ -352,8 +319,8 @@ app.get('/', async (req, res) => {
   <main>
     <div class="card">
       <h2>Search by ID, Tag(s), or Title</h2>
-      <form action="/search" methodtext" id="q" name="q" placeholder="Examples: 6376653485112, pega platform" required>
-        <button class="btn" type="submit">Search &amp; Watch</button>
+      <form action="/search" method="xt" id="q" name="q" placeholder="Examples: 6376653485112, pega platform" required>
+        <button class="btn" type="submit">Search & Watch</button>
       </form>
       <div class="recent">
         <h3>20 Most Recent Uploads</h3>
@@ -363,50 +330,50 @@ app.get('/', async (req, res) => {
       </div>
     </div>
   </main>
-  <script>(function(){var v=\`${qPrefill}\`; if(v){var el=document.getElementById('q'); if(el) el.value=v;}})();</script>
+  <script>
+    (function(){
+      var v = \`${qPrefill}\`;
+      if(v){
+        var el = document.getElementById('q');
+        if(el) el.value = v;
+      }
+    })();
+  </script>
 </body>
 </html>`);
 });
 
-// ---------------- Search Results ----------------
+// --- Search Results ---
 app.get('/search', async (req, res) => {
   const qInput = String(req.query.q || '').trim();
   if (!qInput) return res.redirect('/');
-
   try {
     const token = await getAccessToken();
     const videos = await unifiedSearch(qInput, token);
     const playerId = process.env.BRIGHTCOVE_PLAYER_ID;
     const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
-
     const cards = videos
       .map(
         (v) => `
-      <div class="vcard">
-        <iframe
-          src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
-          allow="autoplay; encrypted-media"
-          allowe)}</div>
-          <div class="id">ID: ${v.id} â€¢ ${fmtDate(v.created_at)}</div>
+        <div class="vcard">
+          <iframe
+            src="https://players.brightcove.net/${AID}/${playerId}_default/index.html?videoId=${v.id}"
+            allow="autoplay; encrypted-media"
+            allowv.id} • ${fmtDate(v.created_at)}</div>
         </div>
-      </div>
-    `,
+      `
       )
       .join('');
-
     res.type('html').send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
   <title>Results</title>
-  <link rel="preconnectpis.com
-  https://fonts.gstatic.com
-  <link://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap
+  https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap
   <style>
     body{font-family:'Open Sans',sans-serif;margin:0;padding:20px;}
     .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:16px;}
     .vcard iframe{width:100%;aspect-ratio:16/9;border:0;}
-    .meta{padding:8px;}
     .title{font-weight:700;}
     .id{font-size:12px;color:#6b7280;}
     a{color:#001f3f;text-decoration:none;font-weight:700;}
@@ -414,7 +381,8 @@ app.get('/search', async (req, res) => {
   </style>
 </head>
 <body>
-  <â† Back</a> | <{downloadUrl}Download Spreadsheet</a>
+  /← Back</a>
+  ${downloadUrl}Download Spreadsheet</a>
   <div class="grid">${cards || '<p>No videos found.</p>'}</div>
 </body>
 </html>`);
@@ -424,7 +392,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---------------- Download Spreadsheet ----------------
+// --- Download Spreadsheet ---
 app.get('/download', async (req, res) => {
   const qInput = String(req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -432,7 +400,6 @@ app.get('/download', async (req, res) => {
     const token = await getAccessToken();
     const videos = await unifiedSearch(qInput, token);
     if (!videos.length) return res.status(404).send('No videos found.');
-
     const wb = new ExcelJS.Workbook();
     wb.created = new Date();
     const ws = wb.addWorksheet('Video Metrics');
@@ -441,39 +408,3 @@ app.get('/download', async (req, res) => {
       { header: 'Title', key: 'title', width: 40 },
       { header: 'All-Time Views', key: 'views', width: 18 },
       { header: 'Daily Avg Views', key: 'dailyAvgViews', width: 18 },
-      { header: 'Impressions', key: 'impressions', width: 18 },
-      { header: 'Engagement', key: 'engagement', width: 18 },
-      { header: 'Play Rate', key: 'playRate', width: 12 },
-      { header: 'Seconds Viewed', key: 'secondsViewed', width: 18 },
-      { header: 'Tags', key: 'tags', width: 40 },
-    ];
-
-    // Fetch metrics concurrently with a modest cap
-    const rows = await mapConcurrent(videos, 4, async (v) => {
-      const m = await getMetricsForVideo(v.id, token);
-      return { ...m, tags: (m.tags || []).join(', ') };
-    });
-
-    for (const row of rows) {
-      if (row instanceof Error) continue;
-      ws.addRow(row);
-    }
-
-    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics.xlsx');
-    res.setHeader(
-      'Content-Type',
-      'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
-    );
-    await wb.xlsx.write(res);
-    res.end();
-  } catch (err) {
-    console.error('Spreadsheet error:', err?.response?.data || err.message);
-    res.status(500).send('Error generating spreadsheet.');
-  }
-});
-
-// ---------------- Health ----------------
-app.get('/healthz', (_req, res) => res.type('text').send('ok'));
-
-// ---------------- Start ----------------
-app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
