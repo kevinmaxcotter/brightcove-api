@@ -1,4 +1,4 @@
-// server.js — Light/Dark + Recent Uploads + Robust Placements Export
+// server.js — Resilient Search (fix 502) + Light/Dark + Recent Uploads + Robust Export
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -23,33 +23,59 @@ if (missing.length) {
 // ---- CONFIG ----
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
-const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);          // count for "Most Recent Uploads"
-const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime'; // e.g. "-90d" or "alltime"
+const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
+const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime';
+
+// Paging/safety knobs for CMS search
+const CMS_PAGE_LIMIT = 100;       // per page (Brightcove max 100)
+const CMS_MAX_PAGES = 5;          // hard cap pages per query (prevents runaway)
+const CMS_TIME_BUDGET_MS = 8000;  // budget for a whole multi-page fetch
 
 // ---- MIDDLEWARE ----
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(express.static('public')); // optional assets (e.g., logos)
+app.use(express.static('public')); // optional assets
 
-// ---- HTTP + TOKEN CACHE ----
-const axiosInstance = axios.create({ timeout: 30000 });
+// ---- HTTP + RETRY HELPERS ----
+const axiosInstance = axios.create({ timeout: 15000 });
+
+// simple backoff sleep
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+
+async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
+  let lastErr;
+  for (let i = 0; i < tries; i++) {
+    try {
+      return await fn();
+    } catch (err) {
+      lastErr = err;
+      const s = err.response?.status;
+      const retriable = s === 429 || (s >= 500 && s < 600) || err.code === 'ECONNABORTED';
+      if (!retriable || i === tries - 1) throw err;
+      await sleep(baseDelay * Math.pow(2, i));
+    }
+  }
+  throw lastErr;
+}
+
 let tokenCache = { access_token: null, expires_at: 0 };
-
 async function getAccessToken() {
   const now = Date.now();
   if (tokenCache.access_token && now < tokenCache.expires_at - 30000) {
     return tokenCache.access_token;
   }
-  const r = await axiosInstance.post(
-    'https://oauth.brightcove.com/v4/access_token',
-    'grant_type=client_credentials',
-    {
-      auth: {
-        username: process.env.BRIGHTCOVE_CLIENT_ID,
-        password: process.env.BRIGHTCOVE_CLIENT_SECRET
-      },
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
-    }
+  const r = await withRetry(() =>
+    axiosInstance.post(
+      'https://oauth.brightcove.com/v4/access_token',
+      'grant_type=client_credentials',
+      {
+        auth: {
+          username: process.env.BRIGHTCOVE_CLIENT_ID,
+          password: process.env.BRIGHTCOVE_CLIENT_SECRET
+        },
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+      }
+    )
   );
   const ttl = (r.data?.expires_in ?? 300) * 1000;
   tokenCache = {
@@ -76,34 +102,42 @@ const hasAllTags = (video, terms) => {
   return terms.every(t => vt.includes(t.toLowerCase()));
 };
 
-// ---- CMS HELPERS ----
-async function cmsSearch(q, token, { limit = 100, offset = 0, sort = '-created_at' } = {}) {
+// ---- CMS HELPERS (with retry + time budget) ----
+async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = '-created_at' } = {}) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
   const fields = 'id,name,images,tags,state,created_at,published_at';
-  const r = await axiosInstance.get(url, {
-    headers: { Authorization: `Bearer ${token}` },
-    params: { q, fields, sort, limit, offset }
-  });
-  return r.data || [];
+  const { data } = await withRetry(() =>
+    axiosInstance.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      params: { q, fields, sort, limit, offset }
+    })
+  );
+  return data || [];
 }
 
 async function fetchAllPages(q, token) {
   const out = [];
   let offset = 0;
-  while (true) {
+  let page = 0;
+  const start = Date.now();
+
+  while (page < CMS_MAX_PAGES && (Date.now() - start) < CMS_TIME_BUDGET_MS) {
     const batch = await cmsSearch(q, token, { offset });
     out.push(...batch);
-    if (batch.length < 100) break;
-    offset += 100;
-    if (out.length > 5000) break; // safety
+    if (batch.length < CMS_PAGE_LIMIT) break;
+    offset += CMS_PAGE_LIMIT;
+    page += 1;
+    if (out.length > 2000) break; // extra safety
   }
   return out;
 }
 
 async function fetchVideoById(id, token) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${id}`;
-  const r = await axiosInstance.get(url, { headers: { Authorization: `Bearer ${token}` } });
-  return r.data;
+  const { data } = await withRetry(() =>
+    axiosInstance.get(url, { headers: { Authorization: `Bearer ${token}` } })
+  );
+  return data;
 }
 
 // ---- RECENT UPLOADS ----
@@ -118,7 +152,7 @@ async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
   }));
 }
 
-// ---- UNIFIED SEARCH ----
+// ---- UNIFIED SEARCH (resilient) ----
 async function unifiedSearch(input, token) {
   const terms = splitTerms(input);
   if (!terms.length) return [];
@@ -128,27 +162,28 @@ async function unifiedSearch(input, token) {
 
   const pool = [];
 
-  // IDs
-  for (const id of idTerms) {
-    try {
-      const v = await fetchVideoById(id, token);
-      if (v && v.state === 'ACTIVE') pool.push(v);
-    } catch {}
-  }
+  // 1) IDs (independent; tolerate per-ID failures)
+  const idFetches = idTerms.map(id =>
+    fetchVideoById(id, token)
+      .then(v => { if (v && v.state === 'ACTIVE') pool.push(v); })
+      .catch(() => {}) // ignore bad IDs
+  );
 
-  // Tags AND (single query)
-  if (nonIds.length) {
-    const qTags = ['state:ACTIVE', ...nonIds.map(t => `tags:"${esc(t)}"`)].join(' ');
-    const byTags = await fetchAllPages(qTags, token);
-    pool.push(...byTags);
-  }
+  // 2) Tags AND (single query)
+  const tagQuery = nonIds.length
+    ? ['state:ACTIVE', ...nonIds.map(t => `tags:"${esc(t)}"`)].join(' ')
+    : null;
 
-  // Title contains terms (union then AND locally)
-  for (const t of nonIds) {
-    const qName = `state:ACTIVE name:*${esc(t)}*`;
-    const chunk = await fetchAllPages(qName, token);
-    pool.push(...chunk);
-  }
+  // 3) Title contains (union queries)
+  const nameQueries = nonIds.map(t => `state:ACTIVE name:*${esc(t)}*`);
+
+  const searchPromises = [
+    ...idFetches,
+    tagQuery ? fetchAllPages(tagQuery, token).then(rows => pool.push(...rows)).catch(e => console.error('[tags] search failed', e.message)) : Promise.resolve(),
+    ...nameQueries.map(q => fetchAllPages(q, token).then(rows => pool.push(...rows)).catch(e => console.error('[name] search failed', e.message)))
+  ];
+
+  await Promise.allSettled(searchPromises);
 
   // Local filter for non-ID terms
   const filtered = nonIds.length ? pool.filter(v => hasAllTags(v, nonIds) || titleContainsAll(v, nonIds)) : pool;
@@ -168,6 +203,7 @@ async function unifiedSearch(input, token) {
     });
   }
 
+  // Newest first
   list.sort((a, b) => new Date(b.created_at) - new Date(a.created_at));
   return list;
 }
@@ -200,22 +236,12 @@ async function getAnalyticsForVideos(videoIds, token) {
       where: `video==${batch.join(',')}`
     });
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const { data } = await axiosInstance.get(`${endpoint}?${params.toString()}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
-        out.push(...(data?.items || []));
-        break;
-      } catch (err) {
-        const status = err.response?.status;
-        if (attempt < 2 && (status === 429 || (status >= 500 && status < 600))) {
-          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
-          continue;
-        }
-        throw err;
-      }
-    }
+    const data = await withRetry(() =>
+      axiosInstance.get(`${endpoint}?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      }).then(r => r.data)
+    );
+    out.push(...(data?.items || []));
   }
   return out;
 }
@@ -242,38 +268,26 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
       where: `video==${batch.join(',')}`
     });
 
-    for (let attempt = 0; attempt < 3; attempt++) {
-      try {
-        const { data } = await axiosInstance.get(`${endpoint}?${params.toString()}`, {
-          headers: { Authorization: `Bearer ${token}` }
-        });
+    const data = await withRetry(() =>
+      axiosInstance.get(`${endpoint}?${params.toString()}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      }).then(r => r.data)
+    );
 
-        const items = (data && data.items) || [];
-        for (const row of items) {
-          const vid = String(row.video);
-          const player = (row.player || '').trim();
-          const domain = (row.destination_domain || '').trim();
-          const path = (row.destination_path || '').trim();
-          const url = domain ? `//${domain}${path.startsWith('/') ? path : (path ? '/' + path : '')}` : '(unknown)';
-          const views = row.video_view || 0;
+    const items = (data && data.items) || [];
+    for (const row of items) {
+      const vid = String(row.video);
+      const player = (row.player || '').trim();
+      const domain = (row.destination_domain || '').trim();
+      const path = (row.destination_path || '').trim();
+      const url = domain ? `//${domain}${path.startsWith('/') ? path : (path ? '/' + path : '')}` : '(unknown)';
+      const views = row.video_view || 0;
 
-          if (!accum.has(vid)) accum.set(vid, new Map());
-          const key = `${player}|${url}`;
-          const cur = accum.get(vid).get(key) || { player, domain, path, url, views: 0 };
-          cur.views += views;
-          accum.get(vid).set(key, cur);
-        }
-        break;
-      } catch (err) {
-        const s = err.response?.status;
-        const body = err.response?.data;
-        console.error('[placements] error', s, body || err.message);
-        if (attempt < 2 && (s === 429 || (s >= 500 && s < 600))) {
-          await new Promise(r => setTimeout(r, 500 * (attempt + 1)));
-          continue;
-        }
-        throw err;
-      }
+      if (!accum.has(vid)) accum.set(vid, new Map());
+      const key = `${player}|${url}`;
+      const cur = accum.get(vid).get(key) || { player, domain, path, url, views: 0 };
+      cur.views += views;
+      accum.get(vid).set(key, cur);
     }
   }
 
@@ -475,7 +489,16 @@ app.get('/', async (req, res) => {
 </html>`);
   } catch (e) {
     console.error('Home error:', e.response?.status, e.response?.data || e.message);
-    res.status(500).send('Error loading home.');
+    // Render a small fallback page instead of 5xx to avoid 502 at edge
+    res.status(200).send(`<!doctype html><meta charset="utf-8"><title>Brightcove Video Tools</title>
+      ${themeHead()}<body style="font-family:system-ui;padding:24px;color:var(--text);background:var(--bg)">
+      <h1>Brightcove Video Tools</h1>
+      <p>We couldn't load recent uploads right now, but search still works.</p>
+      <form action="/search" method="get">
+        <input style="padding:10px;border:1px solid var(--border);background:transparent;color:var(--text);border-radius:8px" name="q" placeholder="Search terms" required />
+        <button class="btn" type="submit" style="margin-left:8px">Search</button>
+      </form>
+      </body>`);
   }
 });
 
@@ -486,10 +509,22 @@ app.get('/search', async (req, res) => {
 
   try {
     const token  = await getAccessToken();
-    const videos = await unifiedSearch(qInput, token);
-    const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
 
-    const cards = videos.map(v => {
+    // Hard time budget for the whole search path to prevent upstream 502
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 20000); // 20s budget for search route
+
+    let videos = [];
+    try {
+      videos = await unifiedSearch(qInput, token);
+    } catch (e) {
+      console.error('[search] unifiedSearch failed', e.response?.status, e.response?.data || e.message);
+      videos = [];
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const cards = (videos || []).map(v => {
       const tags = (v.tags || []).map(t => `<span class="tag">${stripHtml(t)}</span>`).join('');
       return `
         <div class="vcard">
@@ -504,7 +539,9 @@ app.get('/search', async (req, res) => {
         </div>`;
     }).join('');
 
-    res.send(`<!doctype html>
+    const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
+
+    res.status(200).send(`<!doctype html>
 <html>
 <head>
   <meta charset="utf-8"/>
@@ -524,20 +561,25 @@ app.get('/search', async (req, res) => {
       <a class="btn-dl" href="${downloadUrl}">Download Video Analytics Spreadsheet</a>
     </div>
     <div class="card">
-      <div class="grid">
-        ${cards || '<div class="note">No videos found.</div>'}
-      </div>
+      ${videos && videos.length ? '<div class="grid">' + cards + '</div>' : `
+        <div class="note">No videos found or Brightcove search is busy. Try refining your terms.</div>
+      `}
     </div>
   </main>
 </body>
 </html>`);
   } catch (err) {
+    // Instead of 500 (which upstream often shows as 502), render a friendly page
     console.error('Search error:', err.response?.status, err.response?.data || err.message);
-    res.status(500).send('Error searching.');
+    res.status(200).send(`<!doctype html><meta charset="utf-8"><title>Search</title>
+      ${themeHead()}<body style="font-family:system-ui;padding:24px;color:var(--text);background:var(--bg)">
+      <h1>Search Results</h1>
+      <p class="note">We couldn’t complete the search right now. Please try again.</p>
+      <p><a href="/" style="color:var(--link)">← Back</a></p></body>`);
   }
 });
 
-// ---- SPREADSHEET EXPORT (robust: retries, fallback, writeBuffer, debug) ----
+// ---- SPREADSHEET EXPORT (robust) ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   const debug = req.query.debug === '1';
@@ -561,7 +603,7 @@ app.get('/download', async (req, res) => {
     const aMap = new Map();
     for (const item of analytics) aMap.set(String(item.video), item);
 
-    // Placements (per videoId)
+    // Placements
     let placementsMap = new Map();
     let placementsFailed = false;
     try {
@@ -572,7 +614,7 @@ app.get('/download', async (req, res) => {
       if (debug) return res.status(206).json({ step: 'placements', status: e.response?.status, body: e.response?.data || e.message });
     }
 
-    // Build top destinations (URL · views) per video from placements (if available)
+    // Build top destinations (URL · views)
     const topDestByVideo = new Map();
     if (!placementsFailed) {
       for (const [vid, rows] of placementsMap.entries()) {
@@ -673,7 +715,7 @@ app.get('/download', async (req, res) => {
       wx.addRow(['Placements unavailable', 'Your account may not have access to destination_* dimensions or the request failed.']);
     }
 
-    // Send file as buffer
+    // Send as buffer (more reliable than streaming in some environments)
     const buffer = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_with_placements.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -686,7 +728,10 @@ app.get('/download', async (req, res) => {
   }
 });
 
-// ---- START ----
+// ---- HEALTH + NOT FOUND (helps avoid confusing 502s at edge) ----
+app.get('/healthz', (_req, res) => res.status(200).send('ok'));
+app.use((req, res) => res.status(404).send('Not found'));
+
 app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
