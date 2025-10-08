@@ -1,6 +1,6 @@
-// server.js — Keeps your UI & behavior the same, but makes /download finish under timeouts.
-// Adds hard time budgets + concurrency for analytics and sitemap scan,
-// returns partial results instead of failing the download.
+// server.js — Same as your last working version, with a surgical fix:
+// Scanner now only matches embeds that explicitly contain the given videoId.
+// Everything else (UI, search, metrics, time budgets, domain scan) unchanged.
 
 require('dotenv').config();
 const express = require('express');
@@ -39,7 +39,7 @@ const SCAN_CONCURRENCY    = Number(process.env.SCAN_CONCURRENCY || 8);
 
 // Scan size/limits
 const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '').split(',').map(s => s.trim()).filter(Boolean);
-const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 1200); // slightly smaller default to stay under edge timeouts
+const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 1200);
 const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 12000);
 const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.0 (+contact site admin)';
 
@@ -126,7 +126,7 @@ async function fetchAllPages(q, token) {
 async function fetchVideoById(id, token) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${id}`;
   const { data } = await withRetry(() =>
-    axiosHttp.get(url, { headers:{ Authorization:`Bearer ${token}` } })
+    axiosHttp.get(url, { headers: { Authorization: `Bearer ${token}` } })
   );
   return data;
 }
@@ -155,7 +155,7 @@ function parseQuery(input) {
       continue;
     }
     if (looksLikeId(tok)) { ids.push(tok); continue; }
-    tagTerms.push(tok); // bare terms treated as tags (AND)
+    tagTerms.push(tok); // bare terms as tag terms (AND)
   }
   return { ids, tagTerms, titleTerms };
 }
@@ -190,7 +190,6 @@ async function unifiedSearch(input, token) {
 
   const rows = await fetchAllPages(q, token);
 
-  // strict AND post-filter
   const filtered = rows.filter(v =>
     v && v.state === 'ACTIVE' &&
     hasAllTags(v, tagTerms) &&
@@ -290,7 +289,7 @@ function themeToggle(){ return `
 /* ---------- Health ---------- */
 app.get('/healthz', (_req, res) => res.send('ok'));
 
-/* ---------- Home (unchanged structure) ---------- */
+/* ---------- Home ---------- */
 app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
   let recentHTML = '';
@@ -400,7 +399,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Sitemap/domain scan (time-budgeted) ---------- */
+/* ---------- Sitemap/domain scan (ID-specific matching only) ---------- */
 async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const res = await axiosHttp.get(url, {
     timeout: timeoutMs,
@@ -457,33 +456,43 @@ async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
   await Promise.allSettled(domains.map(d => processSitemap(`https://${d}/sitemap.xml`)));
   return Array.from(pages);
 }
+
+/* *** FIXED HERE: only ID-specific patterns (removed generic player pattern) *** */
 function buildPatternsForId(vid) {
   return [
-    new RegExp(`videoId=${vid}(?:[^0-9]|$)`,'i'),
-    new RegExp(`data-video-id=["']${vid}["']`,'i'),
-    new RegExp(`data-brightcove-video-id=["']${vid}["']`,'i'),
-    new RegExp(`data-experience-video-id=["']${vid}["']`,'i'),
-    new RegExp(`"videoId"\\s*:\\s*["']${vid}["']`,'i'),
-    new RegExp(`"data-video-id"\\s*:\\s*["']${vid}["']`,'i'),
-    new RegExp(`"brightcoveVideoId"\\s*:\\s*["']${vid}["']`,'i'),
-    new RegExp(`"bcVideoId"\\s*:\\s*["']${vid}["']`,'i'),
-    new RegExp(`\\bdata-video-id=${vid}\\b`,'i'),
-    new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${vid}["']`,'i'),
-    new RegExp(`brightcove[\\s\\S]{0,200}?["']${vid}["']`,'i'),
-    new RegExp(`players\\.brightcove\\.net\\/\\d+\\/[^\\s"'<>]+`,'i'),
+    // Query-string / attribute embeds that carry the exact ID
+    new RegExp(`videoId=${vid}(?:[^0-9]|$)`, 'i'),
+    new RegExp(`data-video-id=["']${vid}["']`, 'i'),
+    new RegExp(`data-brightcove-video-id=["']${vid}["']`, 'i'),
+    new RegExp(`data-experience-video-id=["']${vid}["']`, 'i'),
+
+    // JSON configs containing the exact ID
+    new RegExp(`"videoId"\\s*:\\s*["']${vid}["']`, 'i'),
+    new RegExp(`"data-video-id"\\s*:\\s*["']${vid}["']`, 'i'),
+    new RegExp(`"brightcoveVideoId"\\s*:\\s*["']${vid}["']`, 'i'),
+    new RegExp(`"bcVideoId"\\s*:\\s*["']${vid}["']`, 'i'),
+
+    // Looser JS init patterns, still containing the exact ID somewhere nearby
+    new RegExp(`\\bdata-video-id=${vid}\\b`, 'i'),
+    new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${vid}["']`, 'i'),
+    new RegExp(`brightcove[\\s\\S]{0,200}?["']${vid}["']`, 'i'),
   ];
 }
+
 async function scanPageForIds(pageUrl, ids) {
   try {
     const html = await fetchText(pageUrl);
     const hits = [];
     for (const vid of ids) {
       const pats = buildPatternsForId(vid);
-      for (const rx of pats) { if (rx.test(html)) { hits.push({ id: String(vid), url: pageUrl }); break; } }
+      for (const rx of pats) {
+        if (rx.test(html)) { hits.push({ id: String(vid), url: pageUrl }); break; }
+      }
     }
     return hits;
   } catch { return []; }
 }
+
 async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX_PAGES, concurrency = SCAN_CONCURRENCY, timeBudgetMs = SCAN_TIME_BUDGET_MS } = {}) {
   if (!domains.length || !ids.length) return new Map();
   const deadlineTs = Date.now() + Math.max(1000, timeBudgetMs);
@@ -520,7 +529,7 @@ app.get('/download', async (req, res) => {
 
     const ids = videos.map(v => v.id);
 
-    // ---- analytics with concurrency + deadline guard
+    // analytics with concurrency + deadline guard
     const rows = new Array(videos.length);
     let idxA = 0;
 
@@ -545,7 +554,6 @@ app.get('/download', async (req, res) => {
       Promise.all(metricsWorkers),
       (async()=>{ while(Date.now()<dlDeadline) await sleep(100); })()
     ]);
-    // Fill any unfinished rows with N/A to guarantee completion
     for (let i=0;i<videos.length;i++){
       if (!rows[i]) {
         const v = videos[i];
@@ -553,11 +561,9 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    // ---- sitemap scan with its own smaller budget (won't block overall)
-    const scanBudgetLeft = Math.max(0, Math.min(SCAN_TIME_BUDGET_MS, dlDeadline - Date.now() - 2000)); // leave 2s to finish
+    const scanBudgetLeft = Math.max(0, Math.min(SCAN_TIME_BUDGET_MS, dlDeadline - Date.now() - 2000));
     const embedsMap = await runSitemapScan(ids, { timeBudgetMs: scanBudgetLeft });
 
-    // ---- build workbook
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
