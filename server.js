@@ -1,4 +1,4 @@
-// server.js — ALL-TIME views fixed with hybrid analytics (v1/data + /v1/alltime fallback)
+// server.js — export never 500s: errors go into an "Errors" sheet; hybrid all-time metrics; placements opt-in; streaming
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -19,21 +19,21 @@ const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 
-// keep exports snappy
+// Keep exports snappy
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
 
-// placements optional (they’re slower)
+// Placements OFF by default (enable per request with ?placements=1)
 const PLACEMENTS_ENABLED = String(process.env.PLACEMENTS_ENABLED || 'false').toLowerCase() === 'true';
 const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime';
 
-// search scope
+// Search scope
 const SEARCH_ACTIVE_ONLY = String(process.env.SEARCH_ACTIVE_ONLY || 'false').toLowerCase() === 'true';
 
 // CMS paging
 const CMS_PAGE_LIMIT = 100;
 const CMS_HARD_CAP_ALLPAGES = Number(process.env.CMS_HARD_CAP_ALLPAGES || 20000);
 
-// title-search budget
+// Title-search budget
 const NAME_MAX_PAGES = Number(process.env.NAME_MAX_PAGES || 5);
 const NAME_TIME_BUDGET_MS = Number(process.env.NAME_TIME_BUDGET_MS || 8000);
 
@@ -56,7 +56,7 @@ async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
       if (!retriable || i===tries-1) throw err; await sleep(baseDelay*Math.pow(2,i)); } }
   throw last;
 }
-const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39'}[m]));
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 const esc = s => String(s).replace(/"/g, '\\"');
 
@@ -195,79 +195,65 @@ async function unifiedSearch(input, token) {
 }
 
 // ---- ALL-TIME ANALYTICS (hybrid) ----
-// 1) batch: /v1/data?dimensions=video&from=alltime
-// 2) fallback per video: /v1/alltime/... (to guarantee non-zero real all-time views)
-async function getAnalyticsForVideos(videoIds, token) {
+async function getAnalyticsForVideos(videoIds, token, errors) {
   if (!Array.isArray(videoIds) || !videoIds.length) return [];
   const endpoint = 'https://analytics.api.brightcove.com/v1/data';
-  const fields = [
-    'video','video_name','video_view','video_impression','play_rate','engagement_score','video_seconds_viewed'
-  ].join(',');
+  const fields = ['video','video_name','video_view','video_impression','play_rate','engagement_score','video_seconds_viewed'].join(',');
 
-  // ---- step 1: batch pull
-  const chunks = [];
-  for (let i=0;i<videoIds.length;i+=100) chunks.push(videoIds.slice(i,i+100));
-  const out = [];
-  const CONCURRENCY = 5; let idx = 0;
+  // step 1: batch pull
+  const chunks = []; for (let i=0;i<videoIds.length;i+=100) chunks.push(videoIds.slice(i,i+100));
+  const out = []; const CONCURRENCY = 5; let idx = 0;
   async function worker() {
     while (idx < chunks.length) {
       const my = idx++; const batch = chunks[my];
       const params = new URLSearchParams({
-        accounts: AID,
-        dimensions: 'video',
-        fields,
-        from: 'alltime',
-        to: 'now',
-        reconciled: 'true',
+        accounts: AID, dimensions: 'video', fields, from: 'alltime', to: 'now', reconciled: 'true',
         where: `video==${batch.join(',')}`
       });
-      const data = await withRetry(() =>
-        axiosInstance.get(`${endpoint}?${params.toString()}`, { headers:{ Authorization:`Bearer ${token}` } })
-          .then(r=>r.data)
-      );
-      out.push(...(data?.items || []));
+      try {
+        const data = await withRetry(() =>
+          axiosInstance.get(`${endpoint}?${params.toString()}`, { headers:{ Authorization:`Bearer ${token}` } })
+            .then(r=>r.data)
+        );
+        out.push(...(data?.items || []));
+      } catch (e) {
+        errors.push({ step: 'analytics-batch', ids: batch.join(','), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
+      }
     }
   }
   await Promise.all(Array.from({length:Math.min(CONCURRENCY,chunks.length)}, worker));
   const byId = new Map(out.map(i => [String(i.video), i]));
 
-  // ---- step 2: per-video fallback for views if missing/zero
+  // step 2: per-video fallback for views if missing/zero
   const needFallback = videoIds.filter(id => {
     const row = byId.get(String(id));
     return !row || !row.video_view || row.video_view === 0;
   });
 
-  if (needFallback.length) {
-    const FALLBACK_CONCURRENCY = 8;
-    let j = 0;
-    async function oneFallback(id) {
-      const url = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${id}`;
-      const data = await withRetry(() =>
-        axiosInstance.get(url, { headers:{ Authorization:`Bearer ${token}` } }).then(r=>r.data)
-      );
-      const views = data?.alltime_video_views ?? data?.alltime_videos_views ?? 0;
-      // merge into the batched row (create if missing)
-      const key = String(id);
-      const existing = byId.get(key) || { video: key };
-      existing.video_view = Math.max(Number(existing.video_view || 0), Number(views || 0));
-      byId.set(key, existing);
-    }
-    async function fallbackWorker() {
-      while (j < needFallback.length) {
-        const vid = needFallback[j++]; await oneFallback(vid).catch(()=>{ /* ignore */ });
+  const FALLBACK_CONC = 8; let j = 0;
+  async function fallbackWorker() {
+    while (j < needFallback.length) {
+      const vid = needFallback[j++]; const url = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${vid}`;
+      try {
+        const data = await withRetry(() =>
+          axiosInstance.get(url, { headers:{ Authorization:`Bearer ${token}` } }).then(r=>r.data)
+        );
+        const views = data?.alltime_video_views ?? data?.alltime_videos_views ?? 0;
+        const key = String(vid);
+        const existing = byId.get(key) || { video: key };
+        existing.video_view = Math.max(Number(existing.video_view || 0), Number(views || 0));
+        byId.set(key, existing);
+      } catch (e) {
+        errors.push({ step: 'analytics-fallback-alltime', id: String(vid), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
       }
     }
-    await Promise.all(Array.from({length:Math.min(FALLBACK_CONCURRENCY, needFallback.length)}, fallbackWorker));
   }
+  await Promise.all(Array.from({length:Math.min(FALLBACK_CONC, needFallback.length)}, fallbackWorker));
 
-  // return a normalized array in the original id order
-  return videoIds.map(id => {
-    const row = byId.get(String(id)) || { video: String(id) };
-    return row;
-  });
+  return videoIds.map(id => byId.get(String(id)) || { video: String(id) });
 }
 
-// ---- PLACEMENTS (optional; auto-detect capability) ----
+// ---- PLACEMENTS (optional; auto-detect) ----
 let DEST_CAPABILITY = null;
 async function detectDestinationCapability(token) {
   if (DEST_CAPABILITY) return DEST_CAPABILITY;
@@ -277,13 +263,17 @@ async function detectDestinationCapability(token) {
   catch { DEST_CAPABILITY='playerOnly'; }
   return DEST_CAPABILITY;
 }
-async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDOW, to = 'now' } = {}) {
-  if (!Array.isArray(videoIds) || !videoIds.length) return { mode:'playerOnly', map:new Map() };
+async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDOW, to = 'now' } = {}, errors) {
+  const out = { mode: 'playerOnly', map: new Map() };
+  if (!Array.isArray(videoIds) || !videoIds.length) return out;
+
   const mode = await detectDestinationCapability(token);
+  out.mode = mode;
+
   const endpoint='https://analytics.api.brightcove.com/v1/data';
   const chunks=[]; for (let i=0;i<videoIds.length;i+=100) chunks.push(videoIds.slice(i,i+100));
-  const resultMap = new Map();
   const CONCURRENCY = 4; let idx=0;
+
   async function worker(){
     while (idx<chunks.length){
       const my = idx++; const batch = chunks[my];
@@ -291,18 +281,22 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
       const dimensions = mode==='full' ? 'video,player,destination_domain,destination_path' : 'video,player';
       const fields = mode==='full' ? 'video,player,destination_domain,destination_path,video_view' : 'video,player,video_view';
       const params = new URLSearchParams({ ...base, dimensions, fields });
-      const data = await withRetry(() => axiosInstance.get(`${endpoint}?${params.toString()}`, { headers:{ Authorization:`Bearer ${token}` } }).then(r=>r.data));
-      const items = (data && data.items) || [];
-      for (const row of items) {
-        const vid = String(row.video); if (!resultMap.has(vid)) resultMap.set(vid, []);
-        if (mode==='full') {
-          const domain = (row.destination_domain||'').trim();
-          const path = (row.destination_path||'').trim();
-          const url = domain ? `//${domain}${path.startsWith('/')?path:(path?'/'+path:'')}` : '(unknown)';
-          resultMap.get(vid).push({ player:(row.player||'').trim(), domain, path, url, views:row.video_view||0 });
-        } else {
-          resultMap.get(vid).push({ player:(row.player||'').trim(), views:row.video_view||0 });
+      try {
+        const data = await withRetry(() => axiosInstance.get(`${endpoint}?${params.toString()}`, { headers:{ Authorization:`Bearer ${token}` } }).then(r=>r.data));
+        const items = (data && data.items) || [];
+        for (const row of items) {
+          const vid = String(row.video); if (!out.map.has(vid)) out.map.set(vid, []);
+          if (mode==='full') {
+            const domain = (row.destination_domain||'').trim();
+            const path = (row.destination_path||'').trim();
+            const url = domain ? `//${domain}${path.startsWith('/')?path:(path?'/'+path:'')}` : '(unknown)';
+            out.map.get(vid).push({ player:(row.player||'').trim(), domain, path, url, views:row.video_view||0 });
+          } else {
+            out.map.get(vid).push({ player:(row.player||'').trim(), views:row.video_view||0 });
+          }
         }
+      } catch (e) {
+        errors.push({ step: 'placements-batch', ids: batch.join(','), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
       }
     }
   }
@@ -310,24 +304,24 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
 
   // compact + sort
   if (mode==='full'){
-    for (const [vid, rows] of resultMap.entries()){
+    for (const [vid, rows] of out.map.entries()){
       const keyMap=new Map();
       for (const r of rows){ const k=`${r.player}|${r.url}`; keyMap.set(k,(keyMap.get(k)||0)+(r.views||0)); }
       const merged = Array.from(keyMap.entries()).map(([k,views])=>{
         const [player,url]=k.split('|'); const domain=url.startsWith('//')?url.slice(2).split('/')[0]:''; const path=url.startsWith('//')?url.slice(2).slice(domain.length)||'/':'';
         return { player, domain, path, url, views };
       }).sort((a,b)=>b.views-a.views);
-      resultMap.set(vid, merged);
+      out.map.set(vid, merged);
     }
   } else {
-    for (const [vid, rows] of resultMap.entries()){
+    for (const [vid, rows] of out.map.entries()){
       const byPlayer=new Map(); for (const r of rows) byPlayer.set(r.player,(byPlayer.get(r.player)||0)+(r.views||0));
       const merged = Array.from(byPlayer.entries()).map(([player,views])=>({player,views})).sort((a,b)=>b.views-a.views);
-      resultMap.set(vid, merged);
+      out.map.set(vid, merged);
     }
   }
 
-  return { mode: DEST_CAPABILITY, map: resultMap };
+  return out;
 }
 
 // ---- THEME (shared CSS + JS) ----
@@ -431,158 +425,160 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- DOWNLOAD: all-time metrics (hybrid), streaming, caps, optional placements, debug ----
+// ---- DOWNLOAD: all-time metrics (hybrid) — ALWAYS returns a file; errors go to "Errors" sheet ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
-  const debug = req.query.debug === '1';
   const wantPlacements = req.query.placements ? req.query.placements === '1' : PLACEMENTS_ENABLED;
   if (!qInput) return res.status(400).send('Missing search terms');
 
-  const fail = (step, err) => {
-    const status = err?.response?.status || 500;
-    const body = err?.response?.data || err?.message || String(err);
-    if (debug) return res.status(500).json({ step, status, body });
-    throw err;
-  };
+  // a place to collect diagnostics that will be written to the "Errors" sheet
+  const errors = [];
+
+  // build workbook up-front so we can always return a file
+  const wb = new ExcelJS.Workbook();
+  const ws = wb.addWorksheet('Video Metrics (All-Time)');
+  ws.columns = [
+    { header: 'Video ID', key: 'id', width: 20 },
+    { header: 'Title', key: 'title', width: 40 },
+    { header: 'All-Time Views', key: 'views', width: 18 },
+    { header: 'Daily Avg Views', key: 'dailyAvgViews', width: 18 },
+    { header: 'All-Time Impressions', key: 'impressions', width: 22 },
+    { header: 'Engagement Score', key: 'engagement', width: 18 },
+    { header: 'Play Rate', key: 'playRate', width: 12 },
+    { header: 'Seconds Viewed', key: 'secondsViewed', width: 18 },
+    { header: 'Tags', key: 'tags', width: 40 },
+    { header: wantPlacements ? `Top Destinations/Players (${PLACEMENTS_WINDOW})` : 'Top Destinations/Players (disabled)', key: 'placementsSummary', width: 70 },
+  ];
+
+  let videos = [];
+  let ids = [];
+  let placementsMode = 'playerOnly';
+  let placementsMap = new Map();
 
   try {
-    const token  = await getAccessToken().catch(e => fail('oauth', e));
-    let videos = await unifiedSearch(qInput, token).catch(e => fail('search', e));
-    if (!videos.length) return res.status(404).send('No videos found for that search.');
+    const token  = await getAccessToken();
+    try {
+      videos = await unifiedSearch(qInput, token);
+    } catch (e) {
+      errors.push({ step: 'search', status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
+      videos = [];
+    }
 
-    let truncated = false;
-    if (videos.length > DOWNLOAD_MAX_VIDEOS) { videos = videos.slice(0, DOWNLOAD_MAX_VIDEOS); truncated = true; }
-    const ids = videos.map(v => v.id);
+    if (!videos.length) {
+      ws.addRow({ id: 'INFO', title: 'No videos matched the query. See Errors sheet if present.' });
+    } else {
+      let truncated = false;
+      if (videos.length > DOWNLOAD_MAX_VIDEOS) { videos = videos.slice(0, DOWNLOAD_MAX_VIDEOS); truncated = true; }
+      if (truncated) { ws.addRow({ id: 'NOTE', title: `Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` }); ws.addRow({}); }
 
-    // ALL-TIME (hybrid) analytics
-    const analytics = await getAnalyticsForVideos(ids, token).catch(e => fail('analytics', e));
-    const aMap = new Map(analytics.map(a => [String(a.video), a]));
+      ids = videos.map(v => v.id);
 
-    // placements (optional)
-    let placementsMode = 'playerOnly', placementsMap = new Map();
-    if (wantPlacements) {
+      // analytics (hybrid all-time)
+      let analytics = [];
       try {
-        const { mode, map } = await getPlacementsForVideos(ids, token, { from: PLACEMENTS_WINDOW, to: 'now' });
-        placementsMode = mode; placementsMap = map;
+        analytics = await getAnalyticsForVideos(ids, token, errors);
       } catch (e) {
-        if (debug) console.warn('[placements]', e?.response?.status, e?.response?.data || e?.message);
+        errors.push({ step: 'analytics', status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
+        analytics = [];
       }
-    }
+      const aMap = new Map(analytics.map(a => [String(a.video), a]));
 
-    // top summary per video
-    const topSummaryByVideo = new Map();
-    for (const [vid, rows] of placementsMap.entries()) {
-      if (placementsMode === 'full') {
-        const byUrl = new Map();
-        for (const r of rows) byUrl.set(r.url, (byUrl.get(r.url) || 0) + (r.views || 0));
-        const top = Array.from(byUrl.entries()).map(([url, views]) => ({ url, views }))
-          .sort((a,b)=>b.views-a.views).slice(0,5);
-        topSummaryByVideo.set(String(vid), top);
-      } else {
-        const byPlayer = new Map();
-        for (const r of rows) byPlayer.set(r.player, (byPlayer.get(r.player) || 0) + (r.views || 0));
-        const top = Array.from(byPlayer.entries()).map(([player, views]) => ({ player, views }))
-          .sort((a,b)=>b.views-a.views).slice(0,5);
-        topSummaryByVideo.set(String(vid), top);
-      }
-    }
-
-    // build workbook (stream)
-    const wb = new ExcelJS.Workbook();
-    const ws = wb.addWorksheet('Video Metrics (All-Time)');
-    const summaryHeader = (wantPlacements && placementsMode==='full')
-      ? `Top Destinations (${PLACEMENTS_WINDOW} · URL · views)`
-      : (wantPlacements ? `Top Players (${PLACEMENTS_WINDOW} · playerId · views)` : 'Top Destinations/Players (disabled)');
-    ws.columns = [
-      { header: 'Video ID', key: 'id', width: 20 },
-      { header: 'Title', key: 'title', width: 40 },
-      { header: 'All-Time Views', key: 'views', width: 18 },
-      { header: 'Daily Avg Views', key: 'dailyAvgViews', width: 18 },
-      { header: 'All-Time Impressions', key: 'impressions', width: 22 },
-      { header: 'Engagement Score', key: 'engagement', width: 18 },
-      { header: 'Play Rate', key: 'playRate', width: 12 },
-      { header: 'Seconds Viewed', key: 'secondsViewed', width: 18 },
-      { header: 'Tags', key: 'tags', width: 40 },
-      { header: summaryHeader, key: 'placementsSummary', width: 70 },
-    ];
-    if (truncated) { ws.addRow({ id: 'NOTE', title: `Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` }); ws.addRow({}); }
-
-    const now = Date.now();
-    for (const v of videos) {
-      const a = aMap.get(String(v.id)) || {};
-      const title = v.name || a.video_name || 'Untitled';
-      const views = a.video_view || 0; // now guaranteed all-time via hybrid
-
-      const basis = v.published_at || v.created_at;
-      let daysSince = 1;
-      if (basis) {
-        const ts = new Date(basis).getTime();
-        if (!Number.isNaN(ts)) daysSince = Math.max(1, Math.ceil((now - ts) / 86400000));
-      }
-      const dailyAvgViews = Number(((views || 0) / daysSince).toFixed(2));
-
-      const top = topSummaryByVideo.get(String(v.id)) || [];
-      const placementsCell = (wantPlacements && top.length)
-        ? (placementsMode === 'full' ? top.map(d => `${d.url} · ${d.views}`).join('; ')
-                                     : top.map(d => `${d.player} · ${d.views}`).join('; '))
-        : (wantPlacements ? '—' : '(disabled)');
-
-      ws.addRow({
-        id: v.id,
-        title,
-        views,
-        dailyAvgViews,
-        impressions: a.video_impression || 0,
-        engagement: a.engagement_score || 0,
-        playRate: a.play_rate || 0,
-        secondsViewed: a.video_seconds_viewed || 0,
-        tags: (v.tags || []).join(', '),
-        placementsSummary: placementsCell
-      });
-    }
-
-    if (wantPlacements) {
-      if (placementsMode === 'full') {
-        const wp = wb.addWorksheet('Placements by Video');
-        wp.columns = [
-          { header: 'Video ID', key: 'video', width: 20 },
-          { header: 'Player ID', key: 'player', width: 28 },
-          { header: 'Destination Domain', key: 'domain', width: 34 },
-          { header: 'Destination Path', key: 'path', width: 50 },
-          { header: 'Full URL (protocol-relative)', key: 'url', width: 60 },
-          { header: `Views (${PLACEMENTS_WINDOW})`, key: 'views', width: 18 },
-        ];
-        for (const vId of ids) {
-          const rows = (placementsMap.get(String(vId)) || []);
-          for (const r of rows) {
-            wp.addRow({ video: vId, player: r.player || '(unknown)', domain: r.domain || '(none)', path: r.path || '(none)', url: r.url, views: r.views || 0 });
-          }
-        }
-      } else {
-        const wp = wb.addWorksheet('Placements by Video (Players)');
-        wp.columns = [
-          { header: 'Video ID', key: 'video', width: 20 },
-          { header: 'Player ID', key: 'player', width: 28 },
-          { header: `Views (${PLACEMENTS_WINDOW})`, key: 'views', width: 18 },
-        ];
-        for (const vId of ids) {
-          const rows = (placementsMap.get(String(vId)) || []);
-          for (const r of rows) {
-            wp.addRow({ video: vId, player: r.player || '(unknown)', views: r.views || 0 });
-          }
+      // placements (optional)
+      if (wantPlacements) {
+        try {
+          const plac = await getPlacementsForVideos(ids, token, { from: PLACEMENTS_WINDOW, to: 'now' }, errors);
+          placementsMode = plac.mode;
+          placementsMap = plac.map;
+        } catch (e) {
+          errors.push({ step: 'placements', status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
         }
       }
+
+      // top summary
+      const topSummaryByVideo = new Map();
+      for (const [vid, rows] of placementsMap.entries()) {
+        if (placementsMode === 'full') {
+          const byUrl = new Map();
+          for (const r of rows) byUrl.set(r.url, (byUrl.get(r.url) || 0) + (r.views || 0));
+          const top = Array.from(byUrl.entries()).map(([url, views]) => ({ url, views }))
+            .sort((a,b)=>b.views-a.views).slice(0,5);
+          topSummaryByVideo.set(String(vid), top);
+        } else {
+          const byPlayer = new Map();
+          for (const r of rows) byPlayer.set(r.player, (byPlayer.get(r.player) || 0) + (r.views || 0));
+          const top = Array.from(byPlayer.entries()).map(([player, views]) => ({ player, views }))
+            .sort((a,b)=>b.views-a.views).slice(0,5);
+          topSummaryByVideo.set(String(vid), top);
+        }
+      }
+
+      // fill summary rows
+      const now = Date.now();
+      for (const v of videos) {
+        const a = aMap.get(String(v.id)) || {};
+        const title = v.name || a.video_name || 'Untitled';
+        const views = a.video_view || 0;
+
+        const basis = v.published_at || v.created_at;
+        let daysSince = 1;
+        if (basis) {
+          const ts = new Date(basis).getTime();
+          if (!Number.isNaN(ts)) daysSince = Math.max(1, Math.ceil((now - ts) / 86400000));
+        }
+        const dailyAvgViews = Number(((views || 0) / daysSince).toFixed(2));
+
+        const top = topSummaryByVideo.get(String(v.id)) || [];
+        const placementsCell = (wantPlacements && top.length)
+          ? (placementsMode === 'full'
+              ? top.map(d => `${d.url} · ${d.views}`).join('; ')
+              : top.map(d => `${d.player} · ${d.views}`).join('; '))
+          : (wantPlacements ? '—' : '(disabled)');
+
+        ws.addRow({
+          id: v.id,
+          title,
+          views,
+          dailyAvgViews,
+          impressions: a.video_impression || 0,
+          engagement: a.engagement_score || 0,
+          playRate: a.play_rate || 0,
+          secondsViewed: a.video_seconds_viewed || 0,
+          tags: (v.tags || []).join(', '),
+          placementsSummary: placementsCell
+        });
+      }
     }
-
-    res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    await wb.xlsx.write(res).catch(e => fail('excel-write', e));
-    return res.end();
-
-  } catch (err) {
-    console.error('[download] fatal', err?.response?.status, err?.response?.data || err?.message || String(err));
-    return res.status(500).send('Error generating spreadsheet.');
+  } catch (e) {
+    errors.push({ step: 'fatal', status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
   }
+
+  // Errors sheet (only if we captured anything)
+  if (errors.length) {
+    const we = wb.addWorksheet('Errors');
+    we.columns = [
+      { header: 'Step', key: 'step', width: 28 },
+      { header: 'IDs/ID', key: 'ids', width: 40 },
+      { header: 'Status', key: 'status', width: 10 },
+      { header: 'Detail', key: 'detail', width: 80 },
+    ];
+    for (const e of errors) we.addRow({ step: e.step, ids: e.ids || e.id || '', status: e.status, detail: typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail) });
+  }
+
+  // STREAM the XLSX (never throw here)
+  res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
+  res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  try {
+    await wb.xlsx.write(res);
+  } catch (e) {
+    // last-ditch: send a tiny CSV so the request still completes
+    try {
+      const csv = 'error\nExcel write failed; see server logs\n';
+      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
+      res.setHeader('Content-Disposition', 'attachment; filename=export_error.csv');
+      res.write(csv);
+    } catch (_) {}
+  }
+  return res.end();
 });
 
 // ---- HEALTH + NOT FOUND ----
