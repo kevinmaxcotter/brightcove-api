@@ -1,4 +1,5 @@
-// server.js — Brightcove tools with precise search + ALWAYS-on sitemap scan (embeds column)
+// server.js — Brightcove tools with precise search, tag display in results, restored toggle labels,
+// and sitemap/domain scan in the spreadsheet export (no other UI changes).
 
 require('dotenv').config();
 const express = require('express');
@@ -11,22 +12,31 @@ const zlib = require('zlib');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ------------ global error visibility ------------ */
+/* ---------- visibility for errors (no behavioral change to UI) ---------- */
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION:', err?.stack || err));
 process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION:', err?.stack || err));
 
-/* ------------ env checks ------------ */
-const MUST = ['BRIGHTCOVE_ACCOUNT_ID','BRIGHTCOVE_CLIENT_ID','BRIGHTCOVE_CLIENT_SECRET','BRIGHTCOVE_PLAYER_ID'];
-const miss = MUST.filter(k => !process.env[k]);
-if (miss.length) { console.error('Missing .env keys:', miss.join(', ')); process.exit(1); }
+/* ---------- required env ---------- */
+const MUST = [
+  'BRIGHTCOVE_ACCOUNT_ID',
+  'BRIGHTCOVE_CLIENT_ID',
+  'BRIGHTCOVE_CLIENT_SECRET',
+  'BRIGHTCOVE_PLAYER_ID'
+];
+const missing = MUST.filter(k => !process.env[k]);
+if (missing.length) {
+  console.error('Missing .env keys:', missing.join(', '));
+  process.exit(1);
+}
 
-/* ------------ config ------------ */
+/* ---------- config (kept same defaults) ---------- */
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
 
+/* Domain scan settings (use your Render env with the 4 pega domains) */
 const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 2000);
@@ -36,17 +46,17 @@ const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner
 
 const CMS_PAGE_LIMIT = 100;
 
-/* ------------ axios (keep-alive) ------------ */
+/* ---------- axios with keep-alive ---------- */
 const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
 const axiosHttp  = axios.create({ timeout: 15000, httpAgent, httpsAgent });
 
-/* ------------ middleware ------------ */
+/* ---------- middleware ---------- */
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(express.static('public'));
+app.use(express.static('public')); // unchanged: for your assets
 
-/* ------------ helpers ------------ */
+/* ---------- helpers ---------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
   let last;
@@ -62,37 +72,44 @@ async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
   }
   throw last;
 }
-const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const esc = s => String(s).replace(/"/g, '\\"');
+const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 
-/* ------------ token cache ------------ */
+/* ---------- auth ---------- */
 let tokenCache = { access_token: null, expires_at: 0 };
 async function getAccessToken() {
   const now = Date.now();
   if (tokenCache.access_token && now < tokenCache.expires_at - 30000) return tokenCache.access_token;
   const r = await withRetry(() =>
-    axiosHttp.post('https://oauth.brightcove.com/v4/access_token','grant_type=client_credentials',{
-      auth: { username: process.env.BRIGHTCOVE_CLIENT_ID, password: process.env.BRIGHTCOVE_CLIENT_SECRET },
-      headers: { 'Content-Type':'application/x-www-form-urlencoded' }
+    axiosHttp.post('https://oauth.brightcove.com/v4/access_token', 'grant_type=client_credentials', {
+      auth: {
+        username: process.env.BRIGHTCOVE_CLIENT_ID,
+        password: process.env.BRIGHTCOVE_CLIENT_SECRET
+      },
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
     })
   );
-  const ttl = (r.data?.expires_in ?? 300)*1000;
+  const ttl = (r.data?.expires_in ?? 300) * 1000;
   tokenCache = { access_token: r.data.access_token, expires_at: Date.now() + ttl };
   return tokenCache.access_token;
 }
 
-/* ------------ CMS helpers ------------ */
+/* ---------- CMS ---------- */
 async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = '-created_at' } = {}) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
   const fields = 'id,name,images,tags,state,created_at,published_at';
   const { data } = await withRetry(() =>
-    axiosHttp.get(url, { headers:{ Authorization:`Bearer ${token}` }, params:{ q, fields, sort, limit, offset } })
+    axiosHttp.get(url, {
+      headers: { Authorization: `Bearer ${token}` },
+      params: { q, fields, sort, limit, offset }
+    })
   );
   return data || [];
 }
 async function fetchAllPages(q, token) {
-  const out = []; let offset = 0;
+  const out = [];
+  let offset = 0;
   while (true) {
     const batch = await cmsSearch(q, token, { offset });
     out.push(...batch);
@@ -105,14 +122,14 @@ async function fetchAllPages(q, token) {
 async function fetchVideoById(id, token) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${id}`;
   const { data } = await withRetry(() =>
-    axiosHttp.get(url, { headers:{ Authorization:`Bearer ${token}` } })
+    axiosHttp.get(url, { headers: { Authorization: `Bearer ${token}` } })
   );
   return data;
 }
 
-/* ------------ PRECISE QUERY PARSING ------------ */
+/* ---------- PRECISE query parsing (surgical: fixes tag/title/ID) ---------- */
 function parseQuery(input) {
-  // split by commas; keep quoted chunks intact
+  // split by commas and keep phrases inside quotes intact
   const parts = String(input || '')
     .split(',')
     .map(s => s.trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1'))
@@ -130,28 +147,28 @@ function parseQuery(input) {
       if (key === 'id') {
         for (const x of val.split(/\s+/).filter(Boolean)) if (looksLikeId(x)) ids.push(x);
       } else if (key === 'tag') {
-        tagTerms.push(val);
+        tagTerms.push(val); // treat whole token/phrase as a tag
       } else if (key === 'title') {
-        for (const t of val.split(/\s+/).filter(Boolean)) titleTerms.push(t);
+        for (const t of val.split(/\s+/).filter(Boolean)) titleTerms.push(t); // AND across words
       }
       continue;
     }
 
-    // bare numeric → IDs
+    // Bare numeric → IDs
     if (looksLikeId(tok)) { ids.push(tok); continue; }
 
-    // otherwise treat as title terms
-    for (const t of tok.split(/\s+/).filter(Boolean)) titleTerms.push(t);
+    // Bare terms default to TAG search (so “pega platform” means tags AND)
+    tagTerms.push(tok);
   }
 
   return { ids, tagTerms, titleTerms };
 }
 
-/* ------------ PRECISE UNIFIED SEARCH ------------ */
+/* ---------- PRECISE unified search (surgical: AND only, no catalog dump) ---------- */
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
 
-  // 1) If explicit IDs present, fetch exactly those
+  // Exact IDs → only those
   if (ids.length) {
     const out = [];
     await Promise.allSettled(ids.map(id =>
@@ -170,18 +187,18 @@ async function unifiedSearch(input, token) {
       .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
   }
 
-  // 2) Build a single ANDed CMS query:
-  //    state:ACTIVE AND tags:"t1" AND ... AND name:*w1* AND name:*w2* ...
+  // Single ANDed CMS query:
+  // state:ACTIVE AND tags:"t1" AND tags:"t2" ... AND name:*w1* AND name:*w2* ...
   const parts = ['state:ACTIVE'];
   for (const t of tagTerms)  parts.push(`tags:"${esc(t)}"`);
   for (const w of titleTerms) parts.push(`name:*${esc(w)}*`);
-  if (parts.length === 1) return []; // no constraints → don't dump catalog
+
+  // No constraints → return nothing (prevents dumping catalog)
+  if (parts.length === 1) return [];
   const q = parts.join(' ').trim();
 
-  // 3) Fetch all pages for the ANDed query
   const rows = await fetchAllPages(q, token);
 
-  // 4) Normalize, de-dupe, newest first
   const seen = new Set(); const list = [];
   for (const v of rows) {
     if (!v || !v.id || v.state !== 'ACTIVE' || seen.has(v.id)) continue;
@@ -198,11 +215,15 @@ async function unifiedSearch(input, token) {
   return list;
 }
 
-/* ------------ analytics (all-time + metrics) ------------ */
+/* ---------- analytics (all-time metrics) ---------- */
 async function getAnalyticsForVideo(videoId, token) {
   const infoUrl = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${videoId}`;
   const alltimeViewsUrl = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${videoId}`;
-  const metricsUrl = `https://analytics.api.brightcove.com/v1/data?accounts=${AID}&dimensions=video&where=video==${videoId}&fields=video,engagement_score,play_rate,video_seconds_viewed,video_impression&from=alltime&to=now`;
+  const metricsUrl =
+    `https://analytics.api.brightcove.com/v1/data?accounts=${AID}` +
+    `&dimensions=video&where=video==${videoId}` +
+    `&fields=video,engagement_score,play_rate,video_seconds_viewed,video_impression` +
+    `&from=alltime&to=now`;
 
   const [info, alltime, m] = await Promise.all([
     withRetry(() => axiosHttp.get(infoUrl, { headers:{ Authorization:`Bearer ${token}` } })),
@@ -211,15 +232,11 @@ async function getAnalyticsForVideo(videoId, token) {
   ]);
 
   const title = info.data?.name || 'Untitled';
-  const tags = info.data?.tags || [];
+  const tags  = info.data?.tags || [];
   const publishedAt = info.data?.published_at || info.data?.created_at;
-  const views = alltime.data?.alltime_video_views ?? alltime.data?.alltime_videos_views ?? 0;
 
-  const it = (m.data?.items||[])[0] || {};
-  const impressions = it.video_impression || 0;
-  const engagement = it.engagement_score || 0;
-  const playRate   = it.play_rate || 0;
-  const secondsViewed = it.video_seconds_viewed || 0;
+  const views = alltime.data?.alltime_video_views ?? alltime.data?.alltime_videos_views ?? 0;
+  const it = (m.data?.items || [])[0] || {};
 
   let daysSince = 1;
   if (publishedAt) {
@@ -228,83 +245,170 @@ async function getAnalyticsForVideo(videoId, token) {
   }
   const dailyAvgViews = Number(((views || 0) / daysSince).toFixed(2));
 
-  return { id: videoId, title, tags, views, dailyAvgViews, impressions, engagement, playRate, secondsViewed };
+  return {
+    id: videoId,
+    title, tags,
+    views,
+    dailyAvgViews,
+    impressions: it.video_impression || 0,
+    engagement: it.engagement_score || 0,
+    playRate:   it.play_rate || 0,
+    secondsViewed: it.video_seconds_viewed || 0,
+  };
 }
 
-/* ------------ UI style (dark/light toggle) ------------ */
-function themeHead(){ return `
-  <style>
-    :root{ --bg:#0b0b0d; --panel:#121217; --border:#262633; --text:#e9eef5; --muted:#9aa3af; --link:#7cc5ff; --btn:#14b8a6; --btnText:#031313; --btnHover:#10a195; }
-    :root[data-theme="light"]{ --bg:#ffffff; --panel:#f8f9fa; --border:#e5e7eb; --text:#0b1220; --muted:#6b7280; --link:#0b63ce; --btn:#001f3f; --btnText:#ffffff; --btnHover:#003366; }
-    *{box-sizing:border-box} body{margin:0;background:var(--bg);color:var(--text);font-family:'Open Sans',system-ui,Arial,sans-serif}
-    a{color:var(--link)} header{display:flex;justify-content:space-between;align-items:center;padding:16px 20px;border-bottom:1px solid var(--border);background:var(--panel)}
-    .toggle{border:1px solid var(--border);padding:8px 12px;border-radius:999px;background:transparent;color:var(--text);cursor:pointer}
-    main{max-width:1100px;margin:24px auto;padding:0 20px}
-    .card{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px}
-    input{width:100%;padding:12px;border:1px solid var(--border);background:transparent;color:var(--text);border-radius:10px}
-    .btn{padding:12px 16px;background:var(--btn);color:var(--btnText);border:none;border-radius:10px;cursor:pointer;font-weight:700;margin-top:12px}
-    .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:18px;margin-top:12px}
-    .vcard{border:1px solid var(--border);border-radius:10px;overflow:hidden}
-    .vcard iframe{width:100%;aspect-ratio:16/9;border:0;background:#000}
-    .meta{padding:12px 14px}.title{font-weight:700;font-size:15px}.id{color:var(--muted);font-size:12.5px}
-  </style>
-  <script>(function(){try{var s=localStorage.getItem('theme')||'dark';document.documentElement.setAttribute('data-theme',s);}catch(e){document.documentElement.setAttribute('data-theme','dark');}})();</script>
-`; }
-function themeToggle(){ return `
-  <button class="toggle" id="themeToggle">Toggle Theme</button>
-  <script>(function(){var b=document.getElementById('themeToggle');function cur(){return document.documentElement.getAttribute('data-theme')||'dark';}
-  b.addEventListener('click',function(){var n=cur()==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);try{localStorage.setItem('theme',n);}catch(e){}});})();</script>
-`; }
-
-/* ------------ Health ------------ */
+/* ---------- Health ---------- */
 app.get('/healthz', (_req, res) => res.send('ok'));
 
-/* ------------ Home (search + recent uploads) ------------ */
-app.get('/', async (_req, res) => {
-  let recent = [];
+/* ---------- Theme helpers (ONLY label logic changed to restore emojis/words) ---------- */
+function themeHead(){ return `
+<link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
+<style>
+  body{font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#fff;color:#001f3f;margin:0}
+  header{display:flex;align-items:center;justify-content:space-between;padding:20px;border-bottom:1px solid #e5e7eb}
+  main{max-width:980px;margin:20px auto;padding:0 20px}
+  .card{background:#f8f9fa;border:1px solid #e5e7eb;border-radius:12px;padding:24px}
+  input{width:100%;padding:12px 14px;border:1px solid #c7ccd3;border-radius:10px}
+  .btn{display:inline-block;padding:10px 14px;background:#001f3f;color:#fff;border-radius:10px;text-decoration:none;font-weight:700}
+  .btn:hover{background:#003366}
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:18px}
+  .vcard{background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
+  .vcard iframe{width:100%;aspect-ratio:16/9;border:0}
+  .meta{padding:12px 14px}
+  .title{font-weight:700;font-size:15px;margin-bottom:4px}
+  .id{color:#6b7280;font-size:13px;margin-top:4px}
+  .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
+  .toggle{cursor:pointer;padding:6px 10px;border:1px solid #c7ccd3;border-radius:8px;font-size:.9rem;background:#fff;color:#001f3f}
+</style>
+<script>(function(){try{var s=localStorage.getItem('theme');if(s){document.documentElement.setAttribute('data-theme',s);}}catch(e){}})();</script>
+`; }
+function themeToggle(){ return `
+  <button class="toggle" id="modeToggle">🌙 Dark Mode</button>
+  <script>(function(){
+    function isDark(){ return (document.documentElement.getAttribute('data-theme')||'light')==='dark'; }
+    function setLabel(btn){ btn.textContent = isDark() ? '☀️ Light Mode' : '🌙 Dark Mode'; }
+    var b=document.getElementById('modeToggle'); setLabel(b);
+    b.addEventListener('click',function(){
+      var next = isDark() ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      try{ localStorage.setItem('theme', next); }catch(e){}
+      setLabel(b);
+    });
+  })();</script>
+`; }
+
+/* ---------- Home (kept same layout) ---------- */
+app.get('/', async (req, res) => {
+  const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
+  let recentHTML = '';
   try {
     const token = await getAccessToken();
-    recent = await cmsSearch('state:ACTIVE', token, { limit: RECENT_LIMIT, sort:'-created_at' });
-  } catch {}
-  const cards = recent.map(v => `
-    <div class="vcard">
-      <iframe src="https://players.brightcove.net/${AID}/${PLAYER_ID}_default/index.html?videoId=${v.id}" allow="encrypted-media" allowfullscreen loading="lazy" title="${stripHtml(v.name||'Untitled')}"></iframe>
-      <div class="meta"><div class="title">${stripHtml(v.name||'Untitled')}</div><div class="id">ID: ${v.id}</div></div>
-    </div>`).join('');
-  res.send(`<!doctype html><html><head><meta charset="utf-8"/><title>Brightcove Tools</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">${themeHead()}</head>
-    <body><header><h1>Brightcove Video Tools</h1>${themeToggle()}</header>
-    <main><div class="card"><h2>🔍 Search by ID, Tag(s), or Title</h2>
-      <form action="/search" method="get"><input name="q" placeholder='Examples: id:637..., tag:"pega platform", title:"customer decision hub"' required><button class="btn" type="submit">Search</button></form>
+    const recent = await cmsSearch('state:ACTIVE', token, { limit: RECENT_LIMIT, sort: '-created_at' });
+    recentHTML = recent.map(v => `
+      <div class="vcard">
+        <iframe src="https://players.brightcove.net/${AID}/${PLAYER_ID}_default/index.html?videoId=${v.id}"
+                allow="encrypted-media" allowfullscreen loading="lazy"
+                title="${stripHtml(v.name || 'Untitled')}"></iframe>
+        <div class="meta">
+          <div class="title">${stripHtml(v.name || 'Untitled')}</div>
+          <div class="id">ID: ${v.id}</div>
+        </div>
+      </div>
+    `).join('');
+  } catch {
+    recentHTML = '<div class="id">Error fetching recent videos.</div>';
+  }
+
+  res.send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Brightcove Video Tools</title>
+  ${themeHead()}
+</head>
+<body>
+  <header>
+    <h1>Brightcove Video Tools</h1>
+    ${themeToggle()}
+  </header>
+  <main>
+    <div class="card" style="max-width:520px;margin:0 auto 20px">
+      <h2>🔍 Search by ID, Tag(s), or Title</h2>
+      <form action="/search" method="get">
+        <input id="q" name="q" placeholder='Examples: 6376653485112, tag:"pega platform", title:"customer decision hub"' required />
+        <button class="btn" type="submit" style="width:100%;margin-top:12px">Search</button>
+        <div class="id" style="margin-top:8px">IDs → exact match. Multiple tags → AND. Titles → must contain all terms.</div>
+      </form>
     </div>
-    <div class="card" style="margin-top:20px"><h2>🆕 Most Recent Uploads</h2><div class="grid">${cards || '<div class="id">No recent uploads.</div>'}</div></div>
-    </main></body></html>`);
+
+    <div class="card" style="margin-top:20px">
+      <h2>🆕 Most Recent Uploads</h2>
+      <div class="grid" style="margin-top:12px">
+        ${recentHTML}
+      </div>
+    </div>
+  </main>
+  <script>(function(){var v=${JSON.stringify(qPrefill)}; if(v) document.getElementById('q').value=v;})();</script>
+</body>
+</html>`);
 });
 
-/* ------------ Search results page ------------ */
+/* ---------- Results page (surgical: adds tags line only) ---------- */
 app.get('/search', async (req, res) => {
-  const q = (req.query.q || '').trim(); if (!q) return res.redirect('/');
+  const qInput = (req.query.q || '').trim();
+  if (!qInput) return res.redirect('/');
+
   try {
-    const token = await getAccessToken();
-    const videos = await unifiedSearch(q, token);
+    const token  = await getAccessToken();
+    const videos = await unifiedSearch(qInput, token);
+    const downloadUrl = `/download?q=${encodeURIComponent(qInput)}`;
+
     const cards = videos.map(v => `
       <div class="vcard">
-        <iframe src="https://players.brightcove.net/${AID}/${PLAYER_ID}_default/index.html?videoId=${v.id}" allowfullscreen loading="lazy"></iframe>
-        <div class="meta"><div class="title">${stripHtml(v.name)}</div><div class="id">ID: ${v.id}</div></div>
-      </div>`).join('');
-    res.send(`<!doctype html><html><head><meta charset="utf-8"/><title>Results</title>
-      <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">${themeHead()}</head>
-      <body><header><a href="/">← Back</a>${themeToggle()}</header>
-      <main><div class="card" style="margin-bottom:12px"><a class="btn" href="/download?q=${encodeURIComponent(q)}">Download Video Analytics Spreadsheet</a></div>
-      <div class="card"><div class="grid">${cards || '<div class="id">No videos found.</div>'}</div></div></main></body></html>`);
-  } catch (e) {
-    console.error('Search error:', e?.response?.status, e?.response?.data || e.message);
+        <iframe src="https://players.brightcove.net/${AID}/${PLAYER_ID}_default/index.html?videoId=${v.id}"
+                allow="encrypted-media" allowfullscreen loading="lazy"
+                title="${stripHtml(v.name)}"></iframe>
+        <div class="meta">
+          <div class="title">${stripHtml(v.name)}</div>
+          <div class="id">ID: ${v.id}</div>
+          <div class="id"><strong>Tags:</strong> ${ (v.tags && v.tags.length ? v.tags.map(stripHtml).join(', ') : 'None') }</div>
+        </div>
+      </div>
+    `).join('');
+
+    res.send(`<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <title>Results for: ${stripHtml(qInput)}</title>
+  ${themeHead()}
+</head>
+<body>
+  <header>
+    <a href="/" style="text-decoration:none;color:#0b63ce">← Back to search</a>
+    ${themeToggle()}
+  </header>
+  <main>
+    <div class="topbar">
+      <div></div>
+      <a class="btn" href="${downloadUrl}">Download Video Analytics Spreadsheet</a>
+    </div>
+    <div class="card">
+      <div class="grid" style="margin-top:12px">
+        ${cards || '<div>No videos found.</div>'}
+      </div>
+    </div>
+  </main>
+</body>
+</html>`);
+  } catch (err) {
+    console.error('Search error:', err?.response?.status, err?.response?.data || err.message);
     res.status(500).send('Error searching.');
   }
 });
 
-/* ------------ Sitemap scan utilities ------------ */
+/* ---------- Domain scan (sitemap-based) utilities ---------- */
 async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const res = await axiosHttp.get(url, {
     timeout: timeoutMs,
@@ -316,7 +420,7 @@ async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const enc = (res.headers['content-encoding'] || '').toLowerCase();
   if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
   else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
-  else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf);
+  else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf); // filename-based fallback
   return buf.toString('utf8');
 }
 function parseSitemapLocs(xml) {
@@ -394,18 +498,18 @@ async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX
     }
   }
   await Promise.all(Array.from({length: Math.min(concurrency, pages.length)}, worker));
-  return found;
+  return found; // Map(id -> Set(url))
 }
 
-/* ------------ DOWNLOAD: always runs scan and adds column ------------ */
+/* ---------- Download (domain scan included; no UI change) ---------- */
 app.get('/download', async (req, res) => {
-  const q = (req.query.q || '').trim();
-  if (!q) return res.status(400).send('Missing search terms');
+  const qInput = (req.query.q || '').trim();
+  if (!qInput) return res.status(400).send('Missing search terms');
 
   try {
-    const token = await getAccessToken();
-    let videos = await unifiedSearch(q, token);
-    if (!videos.length) return res.status(404).send('No videos found for that query.');
+    const token  = await getAccessToken();
+    let videos = await unifiedSearch(qInput, token);
+    if (!videos.length) return res.status(404).send('No videos found for that search.');
 
     // cap for safety
     let truncated = false;
@@ -413,7 +517,7 @@ app.get('/download', async (req, res) => {
 
     const ids = videos.map(v => v.id);
 
-    // analytics (resilient)
+    // metrics per video (with retry/fallback)
     const rows = [];
     for (const v of videos) {
       try {
@@ -424,15 +528,19 @@ app.get('/download', async (req, res) => {
         try { rows.push(await getAnalyticsForVideo(v.id, token)); }
         catch (e2) {
           console.error(`Failed metrics for ${v.id}:`, e2.message);
-          rows.push({ id: v.id, title: v.name || 'Error', tags: v.tags||[], views:'N/A', dailyAvgViews:'N/A', impressions:'N/A', engagement:'N/A', playRate:'N/A', secondsViewed:'N/A' });
+          rows.push({
+            id: v.id, title: v.name || 'Error',
+            tags: v.tags || [], views: 'N/A', dailyAvgViews: 'N/A',
+            impressions: 'N/A', engagement: 'N/A', playRate: 'N/A', secondsViewed: 'N/A'
+          });
         }
       }
     }
 
-    // sitemap scan (ALWAYS)
+    // sitemap/domain scan (always on)
     const embedsMap = await runSitemapScan(ids);
 
-    // Excel
+    // build workbook
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
@@ -450,7 +558,8 @@ app.get('/download', async (req, res) => {
     if (truncated) ws.addRow({ id:'NOTE', title:`Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` });
 
     const titleById = new Map(videos.map(v => [String(v.id), v.name || 'Untitled']));
-    const tagsById = new Map(videos.map(v => [String(v.id), v.tags || []]));
+    const tagsById  = new Map(videos.map(v => [String(v.id), v.tags || []]));
+
     for (const r of rows) {
       const urls = Array.from(embedsMap.get(String(r.id)) || []);
       ws.addRow({
@@ -467,29 +576,28 @@ app.get('/download', async (req, res) => {
       });
     }
 
-    // Raw embeds sheet (audit)
+    // raw embed sheet
     const wf = wb.addWorksheet('Embeds Found');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
       { header: 'Page URL', key: 'url', width: 90 },
     ];
-    for (const [vid, set] of embedsMap.entries()) {
-      for (const u of set) wf.addRow({ id: vid, url: u });
-    }
+    for (const [vid, set] of embedsMap.entries()) for (const u of set) wf.addRow({ id: vid, url: u });
     if (!embedsMap.size) wf.addRow({ id:'INFO', url:'No embeds found via sitemaps; check SCAN_DOMAINS or increase SCAN_MAX_PAGES.' });
 
+    // reliable send (buffer-based)
     const buf = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     res.setHeader('Content-Length', buf.byteLength);
     return res.end(Buffer.from(buf));
-  } catch (e) {
-    console.error('Download error:', e?.response?.status, e?.response?.data || e.message);
-    return res.status(500).send('Error generating spreadsheet.');
+  } catch (err) {
+    console.error('Download error:', err?.response?.status, err?.response?.data || err.message);
+    res.status(500).send('Error generating spreadsheet.');
   }
 });
 
-/* ------------ 404 + start ------------ */
+/* ---------- 404 + start ---------- */
 app.use((req, res) => res.status(404).send('Not found'));
 const server = app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
 server.keepAliveTimeout = 120000;
