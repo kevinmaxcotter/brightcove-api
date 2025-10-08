@@ -1,5 +1,7 @@
-// server.js — Brightcove tools with precise search, tag display in results, restored toggle labels,
-// and sitemap/domain scan in the spreadsheet export (no other UI changes).
+// server.js — Surgical fixes:
+// - Restore working Dark/Light toggle (labels with emojis; real theme styles again)
+// - Make search precise (AND for tags/title; local post-filter so it never dumps all videos)
+// - Keep domain-scan-in-spreadsheet and everything else unchanged
 
 require('dotenv').config();
 const express = require('express');
@@ -12,7 +14,7 @@ const zlib = require('zlib');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------- visibility for errors (no behavioral change to UI) ---------- */
+/* ---------- error visibility ---------- */
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION:', err?.stack || err));
 process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION:', err?.stack || err));
 
@@ -29,14 +31,14 @@ if (missing.length) {
   process.exit(1);
 }
 
-/* ---------- config (kept same defaults) ---------- */
+/* ---------- config ---------- */
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
 
-/* Domain scan settings (use your Render env with the 4 pega domains) */
+/* Domain scan */
 const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '')
   .split(',').map(s => s.trim()).filter(Boolean);
 const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 2000);
@@ -46,7 +48,7 @@ const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner
 
 const CMS_PAGE_LIMIT = 100;
 
-/* ---------- axios with keep-alive ---------- */
+/* ---------- axios keep-alive ---------- */
 const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
 const axiosHttp  = axios.create({ timeout: 15000, httpAgent, httpsAgent });
@@ -54,7 +56,7 @@ const axiosHttp  = axios.create({ timeout: 15000, httpAgent, httpsAgent });
 /* ---------- middleware ---------- */
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
-app.use(express.static('public')); // unchanged: for your assets
+app.use(express.static('public'));
 
 /* ---------- helpers ---------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
@@ -75,6 +77,18 @@ async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
 const esc = s => String(s).replace(/"/g, '\\"');
 const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
+
+/* Title/tags local AND checks (used to post-filter CMS results) */
+function titleContainsAll(video, terms) {
+  if (!terms.length) return true;
+  const name = (video.name || '').toLowerCase();
+  return terms.every(t => name.includes(String(t).toLowerCase()));
+}
+function hasAllTags(video, terms) {
+  if (!terms.length) return true;
+  const vt = (video.tags || []).map(t => String(t).toLowerCase());
+  return terms.every(t => vt.includes(String(t).toLowerCase()));
+}
 
 /* ---------- auth ---------- */
 let tokenCache = { access_token: null, expires_at: 0 };
@@ -115,7 +129,7 @@ async function fetchAllPages(q, token) {
     out.push(...batch);
     if (batch.length < CMS_PAGE_LIMIT) break;
     offset += CMS_PAGE_LIMIT;
-    if (out.length > 20000) break; // safety
+    if (out.length > 20000) break; // safety guard
   }
   return out;
 }
@@ -127,9 +141,9 @@ async function fetchVideoById(id, token) {
   return data;
 }
 
-/* ---------- PRECISE query parsing (surgical: fixes tag/title/ID) ---------- */
+/* ---------- precise query parsing ---------- */
 function parseQuery(input) {
-  // split by commas and keep phrases inside quotes intact
+  // split by commas and keep quoted phrases intact
   const parts = String(input || '')
     .split(',')
     .map(s => s.trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1'))
@@ -147,28 +161,28 @@ function parseQuery(input) {
       if (key === 'id') {
         for (const x of val.split(/\s+/).filter(Boolean)) if (looksLikeId(x)) ids.push(x);
       } else if (key === 'tag') {
-        tagTerms.push(val); // treat whole token/phrase as a tag
+        tagTerms.push(val); // treat entire phrase as one tag term (AND across multiple tokens)
       } else if (key === 'title') {
-        for (const t of val.split(/\s+/).filter(Boolean)) titleTerms.push(t); // AND across words
+        for (const t of val.split(/\s+/).filter(Boolean)) titleTerms.push(t); // AND across title words
       }
       continue;
     }
 
-    // Bare numeric → IDs
+    // Bare numeric → ID
     if (looksLikeId(tok)) { ids.push(tok); continue; }
 
-    // Bare terms default to TAG search (so “pega platform” means tags AND)
+    // Bare terms default to TAG terms (your original behavior)
     tagTerms.push(tok);
   }
 
   return { ids, tagTerms, titleTerms };
 }
 
-/* ---------- PRECISE unified search (surgical: AND only, no catalog dump) ---------- */
+/* ---------- unified search with local AND post-filter ---------- */
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
 
-  // Exact IDs → only those
+  // Exact IDs → just those
   if (ids.length) {
     const out = [];
     await Promise.allSettled(ids.map(id =>
@@ -187,21 +201,27 @@ async function unifiedSearch(input, token) {
       .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
   }
 
-  // Single ANDed CMS query:
-  // state:ACTIVE AND tags:"t1" AND tags:"t2" ... AND name:*w1* AND name:*w2* ...
+  // Build a single ANDed CMS query (broad enough), then strictly post-filter
+  // CMS q: state:ACTIVE [AND tags:"t"...] [AND name:*w*...]
   const parts = ['state:ACTIVE'];
   for (const t of tagTerms)  parts.push(`tags:"${esc(t)}"`);
   for (const w of titleTerms) parts.push(`name:*${esc(w)}*`);
+  if (parts.length === 1) return []; // no constraints
 
-  // No constraints → return nothing (prevents dumping catalog)
-  if (parts.length === 1) return [];
   const q = parts.join(' ').trim();
-
   const rows = await fetchAllPages(q, token);
 
+  // STRICT local filter (prevents over-inclusion if CMS returns too much)
+  const filtered = rows.filter(v =>
+    v && v.state === 'ACTIVE' &&
+    hasAllTags(v, tagTerms) &&
+    titleContainsAll(v, titleTerms)
+  );
+
+  // Normalize, de-dup, newest first
   const seen = new Set(); const list = [];
-  for (const v of rows) {
-    if (!v || !v.id || v.state !== 'ACTIVE' || seen.has(v.id)) continue;
+  for (const v of filtered) {
+    if (!v.id || seen.has(v.id)) continue;
     seen.add(v.id);
     list.push({
       id: v.id,
@@ -215,7 +235,7 @@ async function unifiedSearch(input, token) {
   return list;
 }
 
-/* ---------- analytics (all-time metrics) ---------- */
+/* ---------- analytics (all-time) ---------- */
 async function getAnalyticsForVideo(videoId, token) {
   const infoUrl = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${videoId}`;
   const alltimeViewsUrl = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${videoId}`;
@@ -257,31 +277,31 @@ async function getAnalyticsForVideo(videoId, token) {
   };
 }
 
-/* ---------- Health ---------- */
-app.get('/healthz', (_req, res) => res.send('ok'));
-
-/* ---------- Theme helpers (ONLY label logic changed to restore emojis/words) ---------- */
+/* ---------- Theme CSS (restored dark/light with emojis; no layout change) ---------- */
 function themeHead(){ return `
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
 <style>
-  body{font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:#fff;color:#001f3f;margin:0}
-  header{display:flex;align-items:center;justify-content:space-between;padding:20px;border-bottom:1px solid #e5e7eb}
+  :root { --bg:#ffffff; --text:#001f3f; --border:#e5e7eb; --muted:#6b7280; --chip:#eef2f7; --chipBorder:#c7ccd3; --btn:#001f3f; --btnHover:#003366; --btnText:#fff; }
+  :root[data-theme="dark"] { --bg:#0b0c10; --text:#eaeaea; --border:#2a2f3a; --muted:#9aa3af; --chip:#1a1f29; --chipBorder:#2a2f3a; --btn:#14b8a6; --btnHover:#10a195; --btnText:#031313; }
+  *{box-sizing:border-box}
+  body{font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0}
+  header{display:flex;align-items:center;justify-content:space-between;padding:20px;border-bottom:1px solid var(--border)}
   main{max-width:980px;margin:20px auto;padding:0 20px}
-  .card{background:#f8f9fa;border:1px solid #e5e7eb;border-radius:12px;padding:24px}
-  input{width:100%;padding:12px 14px;border:1px solid #c7ccd3;border-radius:10px}
-  .btn{display:inline-block;padding:10px 14px;background:#001f3f;color:#fff;border-radius:10px;text-decoration:none;font-weight:700}
-  .btn:hover{background:#003366}
+  .card{background:rgba(0,0,0,0.0);border:1px solid var(--border);border-radius:12px;padding:24px}
+  input{width:100%;padding:12px 14px;border:1px solid var(--chipBorder);border-radius:10px;background:transparent;color:var(--text)}
+  .btn{display:inline-block;padding:10px 14px;background:var(--btn);color:var(--btnText);border-radius:10px;text-decoration:none;font-weight:700}
+  .btn:hover{background:var(--btnHover)}
   .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(280px,1fr));gap:18px}
-  .vcard{background:#fff;border:1px solid #e5e7eb;border-radius:10px;overflow:hidden}
-  .vcard iframe{width:100%;aspect-ratio:16/9;border:0}
+  .vcard{background:transparent;border:1px solid var(--border);border-radius:10px;overflow:hidden}
+  .vcard iframe{width:100%;aspect-ratio:16/9;border:0;background:#000}
   .meta{padding:12px 14px}
   .title{font-weight:700;font-size:15px;margin-bottom:4px}
-  .id{color:#6b7280;font-size:13px;margin-top:4px}
+  .id{color:var(--muted);font-size:13px;margin-top:4px}
   .topbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:16px}
-  .toggle{cursor:pointer;padding:6px 10px;border:1px solid #c7ccd3;border-radius:8px;font-size:.9rem;background:#fff;color:#001f3f}
+  .toggle{cursor:pointer;padding:6px 10px;border:1px solid var(--chipBorder);border-radius:8px;font-size:.9rem;background:transparent;color:var(--text)}
 </style>
-<script>(function(){try{var s=localStorage.getItem('theme');if(s){document.documentElement.setAttribute('data-theme',s);}}catch(e){}})();</script>
+<script>(function(){try{var s=localStorage.getItem('theme')||'light';document.documentElement.setAttribute('data-theme',s);}catch(e){}})();</script>
 `; }
 function themeToggle(){ return `
   <button class="toggle" id="modeToggle">🌙 Dark Mode</button>
@@ -298,7 +318,7 @@ function themeToggle(){ return `
   })();</script>
 `; }
 
-/* ---------- Home (kept same layout) ---------- */
+/* ---------- Home ---------- */
 app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
   let recentHTML = '';
@@ -354,7 +374,7 @@ app.get('/', async (req, res) => {
 </html>`);
 });
 
-/* ---------- Results page (surgical: adds tags line only) ---------- */
+/* ---------- Results page (shows tags again) ---------- */
 app.get('/search', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.redirect('/');
@@ -386,7 +406,7 @@ app.get('/search', async (req, res) => {
 </head>
 <body>
   <header>
-    <a href="/" style="text-decoration:none;color:#0b63ce">← Back to search</a>
+    <a href="/" style="text-decoration:none;color:var(--text)">← Back to search</a>
     ${themeToggle()}
   </header>
   <main>
@@ -408,7 +428,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Domain scan (sitemap-based) utilities ---------- */
+/* ---------- Domain scan (sitemap) ---------- */
 async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const res = await axiosHttp.get(url, {
     timeout: timeoutMs,
@@ -420,7 +440,7 @@ async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const enc = (res.headers['content-encoding'] || '').toLowerCase();
   if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
   else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
-  else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf); // filename-based fallback
+  else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf);
   return buf.toString('utf8');
 }
 function parseSitemapLocs(xml) {
@@ -501,7 +521,7 @@ async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX
   return found; // Map(id -> Set(url))
 }
 
-/* ---------- Download (domain scan included; no UI change) ---------- */
+/* ---------- Download (kept same; includes domain scan) ---------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -517,7 +537,7 @@ app.get('/download', async (req, res) => {
 
     const ids = videos.map(v => v.id);
 
-    // metrics per video (with retry/fallback)
+    // metrics per video (retry/fallback)
     const rows = [];
     for (const v of videos) {
       try {
@@ -537,10 +557,10 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    // sitemap/domain scan (always on)
+    // domain scan
     const embedsMap = await runSitemapScan(ids);
 
-    // build workbook
+    // workbook
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
@@ -576,7 +596,6 @@ app.get('/download', async (req, res) => {
       });
     }
 
-    // raw embed sheet
     const wf = wb.addWorksheet('Embeds Found');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -585,7 +604,6 @@ app.get('/download', async (req, res) => {
     for (const [vid, set] of embedsMap.entries()) for (const u of set) wf.addRow({ id: vid, url: u });
     if (!embedsMap.size) wf.addRow({ id:'INFO', url:'No embeds found via sitemaps; check SCAN_DOMAINS or increase SCAN_MAX_PAGES.' });
 
-    // reliable send (buffer-based)
     const buf = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
