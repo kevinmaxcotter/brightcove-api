@@ -1,6 +1,10 @@
-// server.js — Same as your last working version, with a surgical fix:
-// Scanner now only matches embeds that explicitly contain the given videoId.
-// Everything else (UI, search, metrics, time budgets, domain scan) unchanged.
+// server.js — Same UI/behavior. Scanner improved to correctly find page URLs:
+// - robots.txt sitemap discovery (https + http)
+// - fallback sitemap paths (_index, .gz)
+// - brotli (br) support
+// - more ID-specific patterns (still no generic player hits)
+// - structured scan logging
+// - keeps time budgets so downloads complete reliably
 
 require('dotenv').config();
 const express = require('express');
@@ -38,7 +42,8 @@ const METRICS_CONCURRENCY = Number(process.env.METRICS_CONCURRENCY || 6);
 const SCAN_CONCURRENCY    = Number(process.env.SCAN_CONCURRENCY || 8);
 
 // Scan size/limits
-const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '')
+  .split(',').map(s => s.trim()).filter(Boolean);
 const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 1200);
 const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 12000);
 const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.0 (+contact site admin)';
@@ -345,7 +350,7 @@ app.get('/', async (req, res) => {
 </html>`);
 });
 
-/* ---------- Results page (shows tags) ---------- */
+/* ---------- Results page ---------- */
 app.get('/search', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.redirect('/');
@@ -399,23 +404,41 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Sitemap/domain scan (ID-specific matching only) ---------- */
-async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
-  const res = await axiosHttp.get(url, {
+/* ---------- Scanner (improved) ---------- */
+
+// Small logger to summarize scan progress
+function logScan(msg, extra){ try{ console.log('[scan]', msg, extra||''); }catch{} }
+
+async function fetchBinary(url, timeoutMs = SCAN_TIMEOUT_MS) {
+  return axiosHttp.get(url, {
     timeout: timeoutMs,
     responseType: 'arraybuffer',
-    headers: { 'User-Agent': SCAN_USER_AGENT, 'Accept-Encoding': 'gzip,deflate' },
+    headers: {
+      'User-Agent': SCAN_USER_AGENT,
+      'Accept-Encoding': 'br,gzip,deflate' // allow brotli
+    },
     validateStatus: s => s>=200 && s<400
-  });
-  let buf = res.data;
-  const enc = (res.headers['content-encoding'] || '').toLowerCase();
-  if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
-  else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
-  else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf);
+  }).then(r => ({ data: r.data, headers: r.headers }));
+}
+function decodeBody({ data, headers }, url) {
+  let buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+  const enc = (headers['content-encoding'] || '').toLowerCase();
+  try {
+    if (enc.includes('br'))      buf = zlib.brotliDecompressSync(buf);
+    else if (enc.includes('gzip'))   buf = zlib.gunzipSync(buf);
+    else if (enc.includes('deflate'))buf = zlib.inflateSync(buf);
+    else if (/\.gz(\?|$)/i.test(url))buf = zlib.gunzipSync(buf);
+  } catch { /* fall through with original buf */ }
   return buf.toString('utf8');
 }
+async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
+  const res = await fetchBinary(url, timeoutMs);
+  return decodeBody(res, url);
+}
+
 function parseSitemapLocs(xml) {
-  const locs = []; const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi; let m;
+  const locs = [];
+  const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi; let m;
   while ((m = re.exec(xml))) locs.push(m[1]);
   return locs;
 }
@@ -428,13 +451,32 @@ function urlAllowed(u, allowed) {
     return false;
   } catch { return false; }
 }
+async function discoverSitemapsForDomain(domain) {
+  const cands = new Set();
+  const bases = [`https://${domain}`, `http://${domain}`];
+  for (const base of bases) {
+    // robots.txt
+    try {
+      const robots = await fetchText(`${base}/robots.txt`);
+      const lines = robots.split(/\r?\n/);
+      for (const ln of lines) {
+        const m = ln.match(/^\s*Sitemap:\s*(\S+)\s*$/i);
+        if (m && m[1]) cands.add(m[1].trim());
+      }
+    } catch {}
+    // common fallbacks
+    cands.add(`${base}/sitemap.xml`);
+    cands.add(`${base}/sitemap_index.xml`);
+    cands.add(`${base}/sitemap.xml.gz`);
+  }
+  return Array.from(cands);
+}
 async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
   const allowed = domains.map(d => d.toLowerCase());
   const pages = new Set();
 
   async function processSitemap(url) {
-    if (Date.now() >= deadlineTs) return;
-    if (pages.size >= maxPagesTotal) return;
+    if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) return;
     try {
       const xml = await fetchText(url);
       const locs = parseSitemapLocs(xml);
@@ -450,32 +492,42 @@ async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
           if (urlAllowed(u, allowed)) pages.add(u);
         }
       }
-    } catch (e) { console.warn('[sitemap] failed', url, e.message); }
+    } catch (e) { logScan('sitemap failed', { url, err: e.message }); }
   }
 
-  await Promise.allSettled(domains.map(d => processSitemap(`https://${d}/sitemap.xml`)));
+  for (const d of domains) {
+    const sitemaps = await discoverSitemapsForDomain(d);
+    logScan('sitemaps discovered', { domain: d, count: sitemaps.length });
+    await Promise.allSettled(sitemaps.map(processSitemap));
+    logScan('pages so far', { domain: d, pages: pages.size });
+    if (pages.size >= maxPagesTotal || Date.now() >= deadlineTs) break;
+  }
   return Array.from(pages);
 }
 
-/* *** FIXED HERE: only ID-specific patterns (removed generic player pattern) *** */
+/* Only ID-specific patterns (expanded) */
 function buildPatternsForId(vid) {
+  const id = String(vid).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&'); // escape just in case
   return [
-    // Query-string / attribute embeds that carry the exact ID
-    new RegExp(`videoId=${vid}(?:[^0-9]|$)`, 'i'),
-    new RegExp(`data-video-id=["']${vid}["']`, 'i'),
-    new RegExp(`data-brightcove-video-id=["']${vid}["']`, 'i'),
-    new RegExp(`data-experience-video-id=["']${vid}["']`, 'i'),
+    // Query-string and attributes
+    new RegExp(`videoId=${id}(?:[^0-9]|$)`, 'i'),
+    new RegExp(`data-video-id=["']${id}["']`, 'i'),
+    new RegExp(`data-video-id=${id}(?:\\b|[^0-9])`, 'i'),
+    new RegExp(`data-brightcove-video-id=["']${id}["']`, 'i'),
+    new RegExp(`data-experience-video-id=["']${id}["']`, 'i'),
 
-    // JSON configs containing the exact ID
-    new RegExp(`"videoId"\\s*:\\s*["']${vid}["']`, 'i'),
-    new RegExp(`"data-video-id"\\s*:\\s*["']${vid}["']`, 'i'),
-    new RegExp(`"brightcoveVideoId"\\s*:\\s*["']${vid}["']`, 'i'),
-    new RegExp(`"bcVideoId"\\s*:\\s*["']${vid}["']`, 'i'),
+    // JSON-like configs
+    new RegExp(`"videoId"\\s*:\\s*["']${id}["']`, 'i'),
+    new RegExp(`'videoId'\\s*:\\s*'${id}'`, 'i'),
+    new RegExp(`"video_id"\\s*:\\s*["']?${id}["']?`, 'i'),
+    new RegExp(`'video_id'\\s*:\\s*['"]?${id}['"]?`, 'i'),
+    new RegExp(`"brightcoveVideoId"\\s*:\\s*["']${id}["']`, 'i'),
+    new RegExp(`"bcVideoId"\\s*:\\s*["']${id}["']`, 'i'),
 
-    // Looser JS init patterns, still containing the exact ID somewhere nearby
-    new RegExp(`\\bdata-video-id=${vid}\\b`, 'i'),
-    new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${vid}["']`, 'i'),
-    new RegExp(`brightcove[\\s\\S]{0,200}?["']${vid}["']`, 'i'),
+    // JS inits containing the exact ID
+    new RegExp(`\\bdata-video-id=${id}\\b`, 'i'),
+    new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${id}["']`, 'i'),
+    new RegExp(`brightcove[\\s\\S]{0,200}?["']${id}["']`, 'i'),
   ];
 }
 
@@ -498,6 +550,8 @@ async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX
   const deadlineTs = Date.now() + Math.max(1000, timeBudgetMs);
 
   const pages = await discoverPagesFromSitemaps(domains, maxPages, deadlineTs);
+  logScan('discovered pages total', { count: pages.length, domains });
+
   let i = 0; const found = new Map(); for (const id of ids) found.set(String(id), new Set());
 
   async function worker() {
@@ -508,6 +562,11 @@ async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX
     }
   }
   await Promise.all(Array.from({length: Math.min(concurrency, pages.length)}, worker));
+
+  // log summary
+  const totals = {}; for (const [id, set] of found.entries()) totals[id] = set.size;
+  logScan('scan summary', { totals });
+
   return found; // Map(id -> Set(url))
 }
 
@@ -539,11 +598,9 @@ app.get('/download', async (req, res) => {
         try {
           rows[i] = await getAnalyticsForVideo(v.id, token);
         } catch (e1) {
-          console.warn(`Retrying metrics for ${v.id}...`, e1.message);
           await sleep(300);
           try { rows[i] = await getAnalyticsForVideo(v.id, token); }
           catch (e2) {
-            console.error(`Failed metrics for ${v.id}:`, e2.message);
             rows[i] = { id: v.id, title: v.name || 'Error', tags: v.tags||[], views:'N/A', dailyAvgViews:'N/A', impressions:'N/A', engagement:'N/A', playRate:'N/A', secondsViewed:'N/A' };
           }
         }
@@ -606,7 +663,7 @@ app.get('/download', async (req, res) => {
       { header: 'Page URL', key: 'url', width: 90 },
     ];
     for (const [vid, set] of embedsMap.entries()) for (const u of set) wf.addRow({ id: vid, url: u });
-    if (!embedsMap.size) wf.addRow({ id:'INFO', url:'No embeds found within time budget; increase SCAN_TIME_BUDGET_MS/SCAN_MAX_PAGES if needed.' });
+    if (!embedsMap.size) wf.addRow({ id:'INFO', url:'No embeds found within time budget; verify SCAN_DOMAINS or increase SCAN_MAX_PAGES/SCAN_TIME_BUDGET_MS.' });
 
     const buf = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
