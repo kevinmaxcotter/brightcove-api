@@ -1,15 +1,4 @@
-// server.js — Brightcove tools + ALWAYS scan sitemaps to list exact page URLs where video IDs are embedded
-// Requires .env (set in Render Environment):
-//   BRIGHTCOVE_ACCOUNT_ID, BRIGHTCOVE_CLIENT_ID, BRIGHTCOVE_CLIENT_SECRET, BRIGHTCOVE_PLAYER_ID
-//   SCAN_DOMAINS=www.pega.com,community.pega.com,academy.pega.com,support.pega.com
-// Optional tuning (with safe defaults):
-//   PORT=3000
-//   RECENT_LIMIT=9
-//   DOWNLOAD_MAX_VIDEOS=400
-//   SCAN_MAX_PAGES=2000
-//   SCAN_CONCURRENCY=8
-//   SCAN_TIMEOUT_MS=12000
-//   SCAN_USER_AGENT=Brightcove-Embed-Scanner/1.0
+// server.js — Brightcove tools with precise search + ALWAYS-on sitemap scan (embeds column)
 
 require('dotenv').config();
 const express = require('express');
@@ -22,14 +11,14 @@ const zlib = require('zlib');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ------------ global error visibility (helps diagnose Render issues) ------------ */
+/* ------------ global error visibility ------------ */
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION:', err?.stack || err));
 process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION:', err?.stack || err));
 
 /* ------------ env checks ------------ */
 const MUST = ['BRIGHTCOVE_ACCOUNT_ID','BRIGHTCOVE_CLIENT_ID','BRIGHTCOVE_CLIENT_SECRET','BRIGHTCOVE_PLAYER_ID'];
-const missing = MUST.filter(k => !process.env[k]);
-if (missing.length) { console.error('Missing .env keys:', missing.join(', ')); process.exit(1); }
+const miss = MUST.filter(k => !process.env[k]);
+if (miss.length) { console.error('Missing .env keys:', miss.join(', ')); process.exit(1); }
 
 /* ------------ config ------------ */
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
@@ -73,9 +62,9 @@ async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
   }
   throw last;
 }
-const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const esc = s => String(s).replace(/"/g, '\\"');
+const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 
 /* ------------ token cache ------------ */
 let tokenCache = { access_token: null, expires_at: 0 };
@@ -93,7 +82,7 @@ async function getAccessToken() {
   return tokenCache.access_token;
 }
 
-/* ------------ CMS search ------------ */
+/* ------------ CMS helpers ------------ */
 async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = '-created_at' } = {}) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
   const fields = 'id,name,images,tags,state,created_at,published_at';
@@ -109,7 +98,7 @@ async function fetchAllPages(q, token) {
     out.push(...batch);
     if (batch.length < CMS_PAGE_LIMIT) break;
     offset += CMS_PAGE_LIMIT;
-    if (out.length > 20000) break; // hard safety
+    if (out.length > 20000) break; // safety
   }
   return out;
 }
@@ -121,69 +110,91 @@ async function fetchVideoById(id, token) {
   return data;
 }
 
-/* ------------ unified search: IDs + tags AND + title AND ------------ */
+/* ------------ PRECISE QUERY PARSING ------------ */
 function parseQuery(input) {
-  const raw = String(input || '').split(',').map(s => s.trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1')).filter(Boolean);
+  // split by commas; keep quoted chunks intact
+  const parts = String(input || '')
+    .split(',')
+    .map(s => s.trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1'))
+    .filter(Boolean);
+
   const ids = [], tagTerms = [], titleTerms = [];
-  for (let tok of raw) {
+
+  for (const tok of parts) {
     const m = tok.match(/^(id|tag|title)\s*:(.*)$/i);
     if (m) {
-      const key = m[1].toLowerCase(); const val = m[2].trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1');
+      const key = m[1].toLowerCase();
+      const val = m[2].trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1');
       if (!val) continue;
-      if (key==='id' && looksLikeId(val)) ids.push(val);
-      else if (key==='tag') tagTerms.push(val);
-      else if (key==='title') titleTerms.push(val);
+
+      if (key === 'id') {
+        for (const x of val.split(/\s+/).filter(Boolean)) if (looksLikeId(x)) ids.push(x);
+      } else if (key === 'tag') {
+        tagTerms.push(val);
+      } else if (key === 'title') {
+        for (const t of val.split(/\s+/).filter(Boolean)) titleTerms.push(t);
+      }
       continue;
     }
+
+    // bare numeric → IDs
     if (looksLikeId(tok)) { ids.push(tok); continue; }
-    tagTerms.push(tok); // bare tokens treated as tags
+
+    // otherwise treat as title terms
+    for (const t of tok.split(/\s+/).filter(Boolean)) titleTerms.push(t);
   }
+
   return { ids, tagTerms, titleTerms };
 }
+
+/* ------------ PRECISE UNIFIED SEARCH ------------ */
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
-  const pool = [];
 
-  // exact IDs
-  await Promise.allSettled(ids.map(id => fetchVideoById(id, token).then(v => v && pool.push(v))));
-
-  // tags AND
-  if (tagTerms.length) {
-    const qTags = ['state:ACTIVE', ...tagTerms.map(t => `tags:"${esc(t)}"`)].join(' ');
-    const rows = await fetchAllPages(qTags, token);
-    pool.push(...rows);
+  // 1) If explicit IDs present, fetch exactly those
+  if (ids.length) {
+    const out = [];
+    await Promise.allSettled(ids.map(id =>
+      fetchVideoById(id, token).then(v => { if (v && v.state === 'ACTIVE') out.push(v); })
+    ));
+    const seen = new Set();
+    return out
+      .filter(v => v && v.id && v.state==='ACTIVE' && !seen.has(v.id) && seen.add(v.id))
+      .map(v => ({
+        id: v.id,
+        name: v.name || 'Untitled',
+        tags: v.tags || [],
+        thumb: v.images?.thumbnail?.src || v.images?.poster?.src || 'https://via.placeholder.com/320x180.png?text=No+Thumbnail',
+        created_at: v.created_at
+      }))
+      .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
   }
 
-  // title AND (name:*term*) intersection
-  if (titleTerms.length) {
-    const perTerm = await Promise.allSettled(
-      titleTerms.map(t => fetchAllPages(`state:ACTIVE name:*${esc(t)}*`, token))
-    );
-    const buckets = perTerm.map(r => r.status==='fulfilled' ? r.value : []).map(arr => new Map(arr.map(v => [v.id, v])));
-    if (buckets.length) {
-      const counts = new Map();
-      for (const b of buckets) for (const id of b.keys()) counts.set(id, (counts.get(id)||0)+1);
-      const andIds = [...counts.entries()].filter(([,c]) => c===buckets.length).map(([id]) => id);
-      const first = buckets[0];
-      pool.push(...andIds.map(id => first.get(id)).filter(Boolean));
-    }
-  }
+  // 2) Build a single ANDed CMS query:
+  //    state:ACTIVE AND tags:"t1" AND ... AND name:*w1* AND name:*w2* ...
+  const parts = ['state:ACTIVE'];
+  for (const t of tagTerms)  parts.push(`tags:"${esc(t)}"`);
+  for (const w of titleTerms) parts.push(`name:*${esc(w)}*`);
+  if (parts.length === 1) return []; // no constraints → don't dump catalog
+  const q = parts.join(' ').trim();
 
-  // de-dupe + normalize + newest first
+  // 3) Fetch all pages for the ANDed query
+  const rows = await fetchAllPages(q, token);
+
+  // 4) Normalize, de-dupe, newest first
   const seen = new Set(); const list = [];
-  for (const v of pool) {
-    if (!v || !v.id || v.state!=='ACTIVE' || seen.has(v.id)) continue;
+  for (const v of rows) {
+    if (!v || !v.id || v.state !== 'ACTIVE' || seen.has(v.id)) continue;
     seen.add(v.id);
     list.push({
       id: v.id,
       name: v.name || 'Untitled',
       tags: v.tags || [],
-      created_at: v.created_at,
-      published_at: v.published_at,
-      thumb: v.images?.thumbnail?.src || v.images?.poster?.src || 'https://via.placeholder.com/320x180.png?text=No+Thumbnail'
+      thumb: v.images?.thumbnail?.src || v.images?.poster?.src || 'https://via.placeholder.com/320x180.png?text=No+Thumbnail',
+      created_at: v.created_at
     });
   }
-  list.sort((a,b)=>new Date(b.created_at||0)-new Date(a.created_at||0));
+  list.sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
   return list;
 }
 
@@ -220,7 +231,7 @@ async function getAnalyticsForVideo(videoId, token) {
   return { id: videoId, title, tags, views, dailyAvgViews, impressions, engagement, playRate, secondsViewed };
 }
 
-/* ------------ UI: theme css (simple) ------------ */
+/* ------------ UI style (dark/light toggle) ------------ */
 function themeHead(){ return `
   <style>
     :root{ --bg:#0b0b0d; --panel:#121217; --border:#262633; --text:#e9eef5; --muted:#9aa3af; --link:#7cc5ff; --btn:#14b8a6; --btnText:#031313; --btnHover:#10a195; }
@@ -245,7 +256,10 @@ function themeToggle(){ return `
   b.addEventListener('click',function(){var n=cur()==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);try{localStorage.setItem('theme',n);}catch(e){}});})();</script>
 `; }
 
-/* ------------ UI: home ------------ */
+/* ------------ Health ------------ */
+app.get('/healthz', (_req, res) => res.send('ok'));
+
+/* ------------ Home (search + recent uploads) ------------ */
 app.get('/', async (_req, res) => {
   let recent = [];
   try {
@@ -268,7 +282,7 @@ app.get('/', async (_req, res) => {
     </main></body></html>`);
 });
 
-/* ------------ UI: results ------------ */
+/* ------------ Search results page ------------ */
 app.get('/search', async (req, res) => {
   const q = (req.query.q || '').trim(); if (!q) return res.redirect('/');
   try {
@@ -290,8 +304,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ------------ Sitemap scanner (ALWAYS used in /download) ------------ */
-// fetch text with gzip/deflate and .gz fallback
+/* ------------ Sitemap scan utilities ------------ */
 async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const res = await axiosHttp.get(url, {
     timeout: timeoutMs,
@@ -303,7 +316,7 @@ async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const enc = (res.headers['content-encoding'] || '').toLowerCase();
   if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
   else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
-  else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf); // filename-based fallback
+  else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf);
   return buf.toString('utf8');
 }
 function parseSitemapLocs(xml) {
@@ -316,7 +329,7 @@ function urlAllowed(u, allowed) {
     const x = new URL(u);
     if (!/^https?:$/.test(x.protocol)) return false;
     const h = x.hostname.toLowerCase();
-    for (const d of allowed) { if (h===d || h.endsWith('.'+d)) return true; }
+    for (const d of allowed) if (h===d || h.endsWith('.'+d)) return true;
     return false;
   } catch { return false; }
 }
@@ -328,9 +341,9 @@ async function discoverPagesFromSitemaps(domains, maxPagesTotal) {
     try {
       const xml = await fetchText(url);
       const locs = parseSitemapLocs(xml);
-      const sub = locs.filter(u => /\.xml(\.gz)?$/i.test(u));
-      if (sub.length && sub.length >= locs.length * 0.5) {
-        for (const u of sub) { if (pages.size >= maxPagesTotal) break; if (urlAllowed(u, allowed)) await processSitemap(u); }
+      const subs = locs.filter(u => /\.xml(\.gz)?$/i.test(u));
+      if (subs.length && subs.length >= locs.length * 0.5) {
+        for (const u of subs) { if (pages.size >= maxPagesTotal) break; if (urlAllowed(u, allowed)) await processSitemap(u); }
       } else {
         for (const u of locs) { if (pages.size >= maxPagesTotal) break; if (urlAllowed(u, allowed)) pages.add(u); }
       }
@@ -352,27 +365,26 @@ function buildPatternsForId(vid) {
     new RegExp(`\\bdata-video-id=${vid}\\b`,'i'),
     new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${vid}["']`,'i'),
     new RegExp(`brightcove[\\s\\S]{0,200}?["']${vid}["']`,'i'),
-    new RegExp(`players\\.brightcove\\.net\\/\\d+\\/[^\\s"'<>]+`,'i')
+    new RegExp(`players\\.brightcove\\.net\\/\\d+\\/[^\\s"'<>]+`,'i'),
   ];
 }
 async function scanPageForIds(pageUrl, ids) {
   try {
     const html = await fetchText(pageUrl);
-    const out = [];
+    const hits = [];
     for (const vid of ids) {
-      const patterns = buildPatternsForId(vid);
-      for (const rx of patterns) {
-        const m = html.match(rx);
-        if (m) { out.push({ id: String(vid), url: pageUrl }); break; }
+      const pats = buildPatternsForId(vid);
+      for (const rx of pats) {
+        if (rx.test(html)) { hits.push({ id: String(vid), url: pageUrl }); break; }
       }
     }
-    return out;
+    return hits;
   } catch { return []; }
 }
 async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX_PAGES, concurrency = SCAN_CONCURRENCY } = {}) {
   if (!domains.length || !ids.length) return new Map();
   const pages = await discoverPagesFromSitemaps(domains, maxPages);
-  let i = 0; const found = new Map(); // id -> Set(url)
+  let i = 0; const found = new Map();
   for (const id of ids) found.set(String(id), new Set());
   async function worker() {
     while (i < pages.length) {
@@ -382,7 +394,7 @@ async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX
     }
   }
   await Promise.all(Array.from({length: Math.min(concurrency, pages.length)}, worker));
-  return found; // Map(id -> Set(url))
+  return found;
 }
 
 /* ------------ DOWNLOAD: always runs scan and adds column ------------ */
@@ -390,7 +402,6 @@ app.get('/download', async (req, res) => {
   const q = (req.query.q || '').trim();
   if (!q) return res.status(400).send('Missing search terms');
 
-  const errors = [];
   try {
     const token = await getAccessToken();
     let videos = await unifiedSearch(q, token);
@@ -402,7 +413,7 @@ app.get('/download', async (req, res) => {
 
     const ids = videos.map(v => v.id);
 
-    // analytics per video with retry (keeps whole export resilient)
+    // analytics (resilient)
     const rows = [];
     for (const v of videos) {
       try {
@@ -418,10 +429,10 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    // ALWAYS run sitemap scan to find page URLs for each ID
-    const embedsMap = await runSitemapScan(ids); // Map(id -> Set(url))
+    // sitemap scan (ALWAYS)
+    const embedsMap = await runSitemapScan(ids);
 
-    // build Excel
+    // Excel
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
@@ -436,7 +447,6 @@ app.get('/download', async (req, res) => {
       { header: 'Tags', key: 'tags', width: 40 },
       { header: 'Embedded On (URLs)', key: 'embeddedOn', width: 80 },
     ];
-
     if (truncated) ws.addRow({ id:'NOTE', title:`Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` });
 
     const titleById = new Map(videos.map(v => [String(v.id), v.name || 'Untitled']));
@@ -457,7 +467,7 @@ app.get('/download', async (req, res) => {
       });
     }
 
-    // separate sheet with raw embed hits (optional, useful for auditing)
+    // Raw embeds sheet (audit)
     const wf = wb.addWorksheet('Embeds Found');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -475,18 +485,13 @@ app.get('/download', async (req, res) => {
     return res.end(Buffer.from(buf));
   } catch (e) {
     console.error('Download error:', e?.response?.status, e?.response?.data || e.message);
-    if (errors.length) console.error('Errors:', errors);
     return res.status(500).send('Error generating spreadsheet.');
   }
 });
 
-/* ------------ misc ------------ */
-app.get('/healthz', (_req, res) => res.send('ok'));
+/* ------------ 404 + start ------------ */
 app.use((req, res) => res.status(404).send('Not found'));
-
-/* ------------ start ------------ */
 const server = app.listen(PORT, () => console.log(`Server running at http://localhost:${PORT}`));
-// Render keep-alive friendliness
 server.keepAliveTimeout = 120000;
 server.headersTimeout   = 125000;
 server.requestTimeout   = 0;
