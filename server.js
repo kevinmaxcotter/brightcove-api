@@ -1,7 +1,6 @@
-// server.js — Surgical fixes:
-// - Restore working Dark/Light toggle (labels with emojis; real theme styles again)
-// - Make search precise (AND for tags/title; local post-filter so it never dumps all videos)
-// - Keep domain-scan-in-spreadsheet and everything else unchanged
+// server.js — Keeps your UI & behavior the same, but makes /download finish under timeouts.
+// Adds hard time budgets + concurrency for analytics and sitemap scan,
+// returns partial results instead of failing the download.
 
 require('dotenv').config();
 const express = require('express');
@@ -14,22 +13,14 @@ const zlib = require('zlib');
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-/* ---------- error visibility ---------- */
+/* ---------- visibility ---------- */
 process.on('unhandledRejection', err => console.error('UNHANDLED REJECTION:', err?.stack || err));
 process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION:', err?.stack || err));
 
-/* ---------- required env ---------- */
-const MUST = [
-  'BRIGHTCOVE_ACCOUNT_ID',
-  'BRIGHTCOVE_CLIENT_ID',
-  'BRIGHTCOVE_CLIENT_SECRET',
-  'BRIGHTCOVE_PLAYER_ID'
-];
+/* ---------- env checks ---------- */
+const MUST = ['BRIGHTCOVE_ACCOUNT_ID','BRIGHTCOVE_CLIENT_ID','BRIGHTCOVE_CLIENT_SECRET','BRIGHTCOVE_PLAYER_ID'];
 const missing = MUST.filter(k => !process.env[k]);
-if (missing.length) {
-  console.error('Missing .env keys:', missing.join(', '));
-  process.exit(1);
-}
+if (missing.length) { console.error('Missing .env keys:', missing.join(', ')); process.exit(1); }
 
 /* ---------- config ---------- */
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
@@ -38,19 +29,26 @@ const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
 
-/* Domain scan */
-const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '')
-  .split(',').map(s => s.trim()).filter(Boolean);
-const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 2000);
-const SCAN_CONCURRENCY = Number(process.env.SCAN_CONCURRENCY || 8);
+// Time budgets (ms)
+const DOWNLOAD_TIME_BUDGET_MS = Number(process.env.DOWNLOAD_TIME_BUDGET_MS || 60000);
+const SCAN_TIME_BUDGET_MS     = Number(process.env.SCAN_TIME_BUDGET_MS || 25000);
+
+// Concurrency
+const METRICS_CONCURRENCY = Number(process.env.METRICS_CONCURRENCY || 6);
+const SCAN_CONCURRENCY    = Number(process.env.SCAN_CONCURRENCY || 8);
+
+// Scan size/limits
+const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '').split(',').map(s => s.trim()).filter(Boolean);
+const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 1200); // slightly smaller default to stay under edge timeouts
 const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 12000);
 const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.0 (+contact site admin)';
 
+// CMS paging
 const CMS_PAGE_LIMIT = 100;
 
 /* ---------- axios keep-alive ---------- */
-const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
-const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
+const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 100, maxFreeSockets: 20 });
+const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 100, maxFreeSockets: 20 });
 const axiosHttp  = axios.create({ timeout: 15000, httpAgent, httpsAgent });
 
 /* ---------- middleware ---------- */
@@ -78,7 +76,6 @@ const esc = s => String(s).replace(/"/g, '\\"');
 const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 
-/* Title/tags local AND checks (used to post-filter CMS results) */
 function titleContainsAll(video, terms) {
   if (!terms.length) return true;
   const name = (video.name || '').toLowerCase();
@@ -96,15 +93,12 @@ async function getAccessToken() {
   const now = Date.now();
   if (tokenCache.access_token && now < tokenCache.expires_at - 30000) return tokenCache.access_token;
   const r = await withRetry(() =>
-    axiosHttp.post('https://oauth.brightcove.com/v4/access_token', 'grant_type=client_credentials', {
-      auth: {
-        username: process.env.BRIGHTCOVE_CLIENT_ID,
-        password: process.env.BRIGHTCOVE_CLIENT_SECRET
-      },
-      headers: { 'Content-Type': 'application/x-www-form-urlencoded' }
+    axiosHttp.post('https://oauth.brightcove.com/v4/access_token','grant_type=client_credentials',{
+      auth: { username: process.env.BRIGHTCOVE_CLIENT_ID, password: process.env.BRIGHTCOVE_CLIENT_SECRET },
+      headers: { 'Content-Type':'application/x-www-form-urlencoded' }
     })
   );
-  const ttl = (r.data?.expires_in ?? 300) * 1000;
+  const ttl = (r.data?.expires_in ?? 300)*1000;
   tokenCache = { access_token: r.data.access_token, expires_at: Date.now() + ttl };
   return tokenCache.access_token;
 }
@@ -114,75 +108,62 @@ async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = 
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
   const fields = 'id,name,images,tags,state,created_at,published_at';
   const { data } = await withRetry(() =>
-    axiosHttp.get(url, {
-      headers: { Authorization: `Bearer ${token}` },
-      params: { q, fields, sort, limit, offset }
-    })
+    axiosHttp.get(url, { headers:{ Authorization:`Bearer ${token}` }, params:{ q, fields, sort, limit, offset } })
   );
   return data || [];
 }
 async function fetchAllPages(q, token) {
-  const out = [];
-  let offset = 0;
+  const out = []; let offset = 0;
   while (true) {
     const batch = await cmsSearch(q, token, { offset });
     out.push(...batch);
     if (batch.length < CMS_PAGE_LIMIT) break;
     offset += CMS_PAGE_LIMIT;
-    if (out.length > 20000) break; // safety guard
+    if (out.length > 20000) break;
   }
   return out;
 }
 async function fetchVideoById(id, token) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${id}`;
   const { data } = await withRetry(() =>
-    axiosHttp.get(url, { headers: { Authorization: `Bearer ${token}` } })
+    axiosHttp.get(url, { headers:{ Authorization:`Bearer ${token}` } })
   );
   return data;
 }
 
 /* ---------- precise query parsing ---------- */
 function parseQuery(input) {
-  // split by commas and keep quoted phrases intact
   const parts = String(input || '')
     .split(',')
     .map(s => s.trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1'))
     .filter(Boolean);
 
   const ids = [], tagTerms = [], titleTerms = [];
-
   for (const tok of parts) {
     const m = tok.match(/^(id|tag|title)\s*:(.*)$/i);
     if (m) {
       const key = m[1].toLowerCase();
       const val = m[2].trim().replace(/^"(.*)"$/,'$1').replace(/^'(.*)'$/,'$1');
       if (!val) continue;
-
       if (key === 'id') {
         for (const x of val.split(/\s+/).filter(Boolean)) if (looksLikeId(x)) ids.push(x);
       } else if (key === 'tag') {
-        tagTerms.push(val); // treat entire phrase as one tag term (AND across multiple tokens)
+        tagTerms.push(val);
       } else if (key === 'title') {
-        for (const t of val.split(/\s+/).filter(Boolean)) titleTerms.push(t); // AND across title words
+        for (const t of val.split(/\s+/).filter(Boolean)) titleTerms.push(t);
       }
       continue;
     }
-
-    // Bare numeric → ID
     if (looksLikeId(tok)) { ids.push(tok); continue; }
-
-    // Bare terms default to TAG terms (your original behavior)
-    tagTerms.push(tok);
+    tagTerms.push(tok); // bare terms treated as tags (AND)
   }
-
   return { ids, tagTerms, titleTerms };
 }
 
-/* ---------- unified search with local AND post-filter ---------- */
+/* ---------- unified search with strict local AND filter ---------- */
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
 
-  // Exact IDs → just those
   if (ids.length) {
     const out = [];
     await Promise.allSettled(ids.map(id =>
@@ -201,24 +182,21 @@ async function unifiedSearch(input, token) {
       .sort((a,b)=>new Date(b.created_at)-new Date(a.created_at));
   }
 
-  // Build a single ANDed CMS query (broad enough), then strictly post-filter
-  // CMS q: state:ACTIVE [AND tags:"t"...] [AND name:*w*...]
   const parts = ['state:ACTIVE'];
   for (const t of tagTerms)  parts.push(`tags:"${esc(t)}"`);
   for (const w of titleTerms) parts.push(`name:*${esc(w)}*`);
-  if (parts.length === 1) return []; // no constraints
-
+  if (parts.length === 1) return [];
   const q = parts.join(' ').trim();
+
   const rows = await fetchAllPages(q, token);
 
-  // STRICT local filter (prevents over-inclusion if CMS returns too much)
+  // strict AND post-filter
   const filtered = rows.filter(v =>
     v && v.state === 'ACTIVE' &&
     hasAllTags(v, tagTerms) &&
     titleContainsAll(v, titleTerms)
   );
 
-  // Normalize, de-dup, newest first
   const seen = new Set(); const list = [];
   for (const v of filtered) {
     if (!v.id || seen.has(v.id)) continue;
@@ -239,11 +217,7 @@ async function unifiedSearch(input, token) {
 async function getAnalyticsForVideo(videoId, token) {
   const infoUrl = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos/${videoId}`;
   const alltimeViewsUrl = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${videoId}`;
-  const metricsUrl =
-    `https://analytics.api.brightcove.com/v1/data?accounts=${AID}` +
-    `&dimensions=video&where=video==${videoId}` +
-    `&fields=video,engagement_score,play_rate,video_seconds_viewed,video_impression` +
-    `&from=alltime&to=now`;
+  const metricsUrl = `https://analytics.api.brightcove.com/v1/data?accounts=${AID}&dimensions=video&where=video==${videoId}&fields=video,engagement_score,play_rate,video_seconds_viewed,video_impression&from=alltime&to=now`;
 
   const [info, alltime, m] = await Promise.all([
     withRetry(() => axiosHttp.get(infoUrl, { headers:{ Authorization:`Bearer ${token}` } })),
@@ -254,9 +228,13 @@ async function getAnalyticsForVideo(videoId, token) {
   const title = info.data?.name || 'Untitled';
   const tags  = info.data?.tags || [];
   const publishedAt = info.data?.published_at || info.data?.created_at;
-
   const views = alltime.data?.alltime_video_views ?? alltime.data?.alltime_videos_views ?? 0;
-  const it = (m.data?.items || [])[0] || {};
+
+  const it = (m.data?.items||[])[0] || {};
+  const impressions = it.video_impression || 0;
+  const engagement = it.engagement_score || 0;
+  const playRate   = it.play_rate || 0;
+  const secondsViewed = it.video_seconds_viewed || 0;
 
   let daysSince = 1;
   if (publishedAt) {
@@ -265,19 +243,10 @@ async function getAnalyticsForVideo(videoId, token) {
   }
   const dailyAvgViews = Number(((views || 0) / daysSince).toFixed(2));
 
-  return {
-    id: videoId,
-    title, tags,
-    views,
-    dailyAvgViews,
-    impressions: it.video_impression || 0,
-    engagement: it.engagement_score || 0,
-    playRate:   it.play_rate || 0,
-    secondsViewed: it.video_seconds_viewed || 0,
-  };
+  return { id: videoId, title, tags, views, dailyAvgViews, impressions, engagement, playRate, secondsViewed };
 }
 
-/* ---------- Theme CSS (restored dark/light with emojis; no layout change) ---------- */
+/* ---------- UI theme (unchanged look; working toggle) ---------- */
 function themeHead(){ return `
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
@@ -318,7 +287,10 @@ function themeToggle(){ return `
   })();</script>
 `; }
 
-/* ---------- Home ---------- */
+/* ---------- Health ---------- */
+app.get('/healthz', (_req, res) => res.send('ok'));
+
+/* ---------- Home (unchanged structure) ---------- */
 app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
   let recentHTML = '';
@@ -374,7 +346,7 @@ app.get('/', async (req, res) => {
 </html>`);
 });
 
-/* ---------- Results page (shows tags again) ---------- */
+/* ---------- Results page (shows tags) ---------- */
 app.get('/search', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.redirect('/');
@@ -428,7 +400,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Domain scan (sitemap) ---------- */
+/* ---------- Sitemap/domain scan (time-budgeted) ---------- */
 async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
   const res = await axiosHttp.get(url, {
     timeout: timeoutMs,
@@ -457,22 +429,31 @@ function urlAllowed(u, allowed) {
     return false;
   } catch { return false; }
 }
-async function discoverPagesFromSitemaps(domains, maxPagesTotal) {
+async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
   const allowed = domains.map(d => d.toLowerCase());
   const pages = new Set();
+
   async function processSitemap(url) {
+    if (Date.now() >= deadlineTs) return;
     if (pages.size >= maxPagesTotal) return;
     try {
       const xml = await fetchText(url);
       const locs = parseSitemapLocs(xml);
       const subs = locs.filter(u => /\.xml(\.gz)?$/i.test(u));
       if (subs.length && subs.length >= locs.length * 0.5) {
-        for (const u of subs) { if (pages.size >= maxPagesTotal) break; if (urlAllowed(u, allowed)) await processSitemap(u); }
+        for (const u of subs) {
+          if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
+          if (urlAllowed(u, allowed)) await processSitemap(u);
+        }
       } else {
-        for (const u of locs) { if (pages.size >= maxPagesTotal) break; if (urlAllowed(u, allowed)) pages.add(u); }
+        for (const u of locs) {
+          if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
+          if (urlAllowed(u, allowed)) pages.add(u);
+        }
       }
     } catch (e) { console.warn('[sitemap] failed', url, e.message); }
   }
+
   await Promise.allSettled(domains.map(d => processSitemap(`https://${d}/sitemap.xml`)));
   return Array.from(pages);
 }
@@ -498,20 +479,20 @@ async function scanPageForIds(pageUrl, ids) {
     const hits = [];
     for (const vid of ids) {
       const pats = buildPatternsForId(vid);
-      for (const rx of pats) {
-        if (rx.test(html)) { hits.push({ id: String(vid), url: pageUrl }); break; }
-      }
+      for (const rx of pats) { if (rx.test(html)) { hits.push({ id: String(vid), url: pageUrl }); break; } }
     }
     return hits;
   } catch { return []; }
 }
-async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX_PAGES, concurrency = SCAN_CONCURRENCY } = {}) {
+async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX_PAGES, concurrency = SCAN_CONCURRENCY, timeBudgetMs = SCAN_TIME_BUDGET_MS } = {}) {
   if (!domains.length || !ids.length) return new Map();
-  const pages = await discoverPagesFromSitemaps(domains, maxPages);
-  let i = 0; const found = new Map();
-  for (const id of ids) found.set(String(id), new Set());
+  const deadlineTs = Date.now() + Math.max(1000, timeBudgetMs);
+
+  const pages = await discoverPagesFromSitemaps(domains, maxPages, deadlineTs);
+  let i = 0; const found = new Map(); for (const id of ids) found.set(String(id), new Set());
+
   async function worker() {
-    while (i < pages.length) {
+    while (i < pages.length && Date.now() < deadlineTs) {
       const idx = i++; const url = pages[idx];
       const hits = await scanPageForIds(url, ids);
       for (const h of hits) found.get(h.id).add(h.url);
@@ -521,10 +502,12 @@ async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX
   return found; // Map(id -> Set(url))
 }
 
-/* ---------- Download (kept same; includes domain scan) ---------- */
+/* ---------- Download (time-budgeted & concurrent) ---------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
+
+  const dlDeadline = Date.now() + DOWNLOAD_TIME_BUDGET_MS;
 
   try {
     const token  = await getAccessToken();
@@ -537,30 +520,44 @@ app.get('/download', async (req, res) => {
 
     const ids = videos.map(v => v.id);
 
-    // metrics per video (retry/fallback)
-    const rows = [];
-    for (const v of videos) {
-      try {
-        rows.push(await getAnalyticsForVideo(v.id, token));
-      } catch (e1) {
-        console.warn(`Retrying metrics for ${v.id}...`, e1.message);
-        await sleep(600);
-        try { rows.push(await getAnalyticsForVideo(v.id, token)); }
-        catch (e2) {
-          console.error(`Failed metrics for ${v.id}:`, e2.message);
-          rows.push({
-            id: v.id, title: v.name || 'Error',
-            tags: v.tags || [], views: 'N/A', dailyAvgViews: 'N/A',
-            impressions: 'N/A', engagement: 'N/A', playRate: 'N/A', secondsViewed: 'N/A'
-          });
+    // ---- analytics with concurrency + deadline guard
+    const rows = new Array(videos.length);
+    let idxA = 0;
+
+    async function metricsWorker() {
+      while (Date.now() < dlDeadline && idxA < videos.length) {
+        const i = idxA++; const v = videos[i];
+        try {
+          rows[i] = await getAnalyticsForVideo(v.id, token);
+        } catch (e1) {
+          console.warn(`Retrying metrics for ${v.id}...`, e1.message);
+          await sleep(300);
+          try { rows[i] = await getAnalyticsForVideo(v.id, token); }
+          catch (e2) {
+            console.error(`Failed metrics for ${v.id}:`, e2.message);
+            rows[i] = { id: v.id, title: v.name || 'Error', tags: v.tags||[], views:'N/A', dailyAvgViews:'N/A', impressions:'N/A', engagement:'N/A', playRate:'N/A', secondsViewed:'N/A' };
+          }
         }
       }
     }
+    const metricsWorkers = Array.from({length: Math.min(METRICS_CONCURRENCY, videos.length)}, metricsWorker);
+    await Promise.race([
+      Promise.all(metricsWorkers),
+      (async()=>{ while(Date.now()<dlDeadline) await sleep(100); })()
+    ]);
+    // Fill any unfinished rows with N/A to guarantee completion
+    for (let i=0;i<videos.length;i++){
+      if (!rows[i]) {
+        const v = videos[i];
+        rows[i] = { id: v.id, title: v.name || 'Timeout', tags: v.tags||[], views:'N/A', dailyAvgViews:'N/A', impressions:'N/A', engagement:'N/A', playRate:'N/A', secondsViewed:'N/A' };
+      }
+    }
 
-    // domain scan
-    const embedsMap = await runSitemapScan(ids);
+    // ---- sitemap scan with its own smaller budget (won't block overall)
+    const scanBudgetLeft = Math.max(0, Math.min(SCAN_TIME_BUDGET_MS, dlDeadline - Date.now() - 2000)); // leave 2s to finish
+    const embedsMap = await runSitemapScan(ids, { timeBudgetMs: scanBudgetLeft });
 
-    // workbook
+    // ---- build workbook
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
@@ -576,6 +573,7 @@ app.get('/download', async (req, res) => {
       { header: 'Embedded On (URLs)', key: 'embeddedOn', width: 80 },
     ];
     if (truncated) ws.addRow({ id:'NOTE', title:`Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` });
+    if (Date.now() >= dlDeadline) ws.addRow({ id:'NOTE', title:`Export reached time budget; some rows may show N/A or partial embeds.` });
 
     const titleById = new Map(videos.map(v => [String(v.id), v.name || 'Untitled']));
     const tagsById  = new Map(videos.map(v => [String(v.id), v.tags || []]));
@@ -602,7 +600,7 @@ app.get('/download', async (req, res) => {
       { header: 'Page URL', key: 'url', width: 90 },
     ];
     for (const [vid, set] of embedsMap.entries()) for (const u of set) wf.addRow({ id: vid, url: u });
-    if (!embedsMap.size) wf.addRow({ id:'INFO', url:'No embeds found via sitemaps; check SCAN_DOMAINS or increase SCAN_MAX_PAGES.' });
+    if (!embedsMap.size) wf.addRow({ id:'INFO', url:'No embeds found within time budget; increase SCAN_TIME_BUDGET_MS/SCAN_MAX_PAGES if needed.' });
 
     const buf = await wb.xlsx.writeBuffer();
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
