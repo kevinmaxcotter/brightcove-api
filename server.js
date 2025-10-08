@@ -1,4 +1,4 @@
-// server.js — 502-hardened: streaming XLSX, keep-alive, capped export, optional placements, fast concurrency
+// server.js — ALL-TIME views fixed with hybrid analytics (v1/data + /v1/alltime fallback)
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
@@ -19,21 +19,21 @@ const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 
-// Keep exports snappy to avoid proxy timeouts (raise if your infra allows)
+// keep exports snappy
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
 
-// Placements are heavy; off by default. Enable account-wide with env or per-request with ?placements=1
+// placements optional (they’re slower)
 const PLACEMENTS_ENABLED = String(process.env.PLACEMENTS_ENABLED || 'false').toLowerCase() === 'true';
-const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime'; // keep alltime per your requirement
+const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime';
 
-// Search scope
+// search scope
 const SEARCH_ACTIVE_ONLY = String(process.env.SEARCH_ACTIVE_ONLY || 'false').toLowerCase() === 'true';
 
-// CMS paging knobs
+// CMS paging
 const CMS_PAGE_LIMIT = 100;
 const CMS_HARD_CAP_ALLPAGES = Number(process.env.CMS_HARD_CAP_ALLPAGES || 20000);
 
-// Title-search safety knobs
+// title-search budget
 const NAME_MAX_PAGES = Number(process.env.NAME_MAX_PAGES || 5);
 const NAME_TIME_BUDGET_MS = Number(process.env.NAME_TIME_BUDGET_MS || 8000);
 
@@ -143,7 +143,7 @@ async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
   }));
 }
 
-// ---- UNIFIED SEARCH (ID + TAG + TITLE; full tag coverage) ----
+// ---- UNIFIED SEARCH ----
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
   const pool = [];
@@ -194,32 +194,80 @@ async function unifiedSearch(input, token) {
   return list;
 }
 
-// ---- ALL-TIME ANALYTICS (BATCHED, CONCURRENCY-LIMITED) ----
+// ---- ALL-TIME ANALYTICS (hybrid) ----
+// 1) batch: /v1/data?dimensions=video&from=alltime
+// 2) fallback per video: /v1/alltime/... (to guarantee non-zero real all-time views)
 async function getAnalyticsForVideos(videoIds, token) {
   if (!Array.isArray(videoIds) || !videoIds.length) return [];
   const endpoint = 'https://analytics.api.brightcove.com/v1/data';
-  const fields = ['video','video_name','video_view','video_impression','play_rate','engagement_score','video_seconds_viewed'].join(',');
+  const fields = [
+    'video','video_name','video_view','video_impression','play_rate','engagement_score','video_seconds_viewed'
+  ].join(',');
+
+  // ---- step 1: batch pull
   const chunks = [];
   for (let i=0;i<videoIds.length;i+=100) chunks.push(videoIds.slice(i,i+100));
-
   const out = [];
-  // limit concurrency to 5 parallel chunk requests (keeps it fast but safe)
-  const CONCURRENCY = 5;
-  let idx = 0;
+  const CONCURRENCY = 5; let idx = 0;
   async function worker() {
     while (idx < chunks.length) {
       const my = idx++; const batch = chunks[my];
-      const params = new URLSearchParams({ accounts:AID, dimensions:'video', fields, from:'alltime', to:'now', where:`video==${batch.join(',')}` });
-      const data = await withRetry(() => axiosInstance.get(`${endpoint}?${params.toString()}`, { headers:{ Authorization:`Bearer ${token}` } }).then(r=>r.data));
-      out.push(...(data?.items||[]));
+      const params = new URLSearchParams({
+        accounts: AID,
+        dimensions: 'video',
+        fields,
+        from: 'alltime',
+        to: 'now',
+        reconciled: 'true',
+        where: `video==${batch.join(',')}`
+      });
+      const data = await withRetry(() =>
+        axiosInstance.get(`${endpoint}?${params.toString()}`, { headers:{ Authorization:`Bearer ${token}` } })
+          .then(r=>r.data)
+      );
+      out.push(...(data?.items || []));
     }
   }
-  const workers = Array.from({length:Math.min(CONCURRENCY,chunks.length)}, worker);
-  await Promise.all(workers);
-  return out;
+  await Promise.all(Array.from({length:Math.min(CONCURRENCY,chunks.length)}, worker));
+  const byId = new Map(out.map(i => [String(i.video), i]));
+
+  // ---- step 2: per-video fallback for views if missing/zero
+  const needFallback = videoIds.filter(id => {
+    const row = byId.get(String(id));
+    return !row || !row.video_view || row.video_view === 0;
+  });
+
+  if (needFallback.length) {
+    const FALLBACK_CONCURRENCY = 8;
+    let j = 0;
+    async function oneFallback(id) {
+      const url = `https://analytics.api.brightcove.com/v1/alltime/accounts/${AID}/videos/${id}`;
+      const data = await withRetry(() =>
+        axiosInstance.get(url, { headers:{ Authorization:`Bearer ${token}` } }).then(r=>r.data)
+      );
+      const views = data?.alltime_video_views ?? data?.alltime_videos_views ?? 0;
+      // merge into the batched row (create if missing)
+      const key = String(id);
+      const existing = byId.get(key) || { video: key };
+      existing.video_view = Math.max(Number(existing.video_view || 0), Number(views || 0));
+      byId.set(key, existing);
+    }
+    async function fallbackWorker() {
+      while (j < needFallback.length) {
+        const vid = needFallback[j++]; await oneFallback(vid).catch(()=>{ /* ignore */ });
+      }
+    }
+    await Promise.all(Array.from({length:Math.min(FALLBACK_CONCURRENCY, needFallback.length)}, fallbackWorker));
+  }
+
+  // return a normalized array in the original id order
+  return videoIds.map(id => {
+    const row = byId.get(String(id)) || { video: String(id) };
+    return row;
+  });
 }
 
-// ---- PLACEMENTS (auto-detect; optional) ----
+// ---- PLACEMENTS (optional; auto-detect capability) ----
 let DEST_CAPABILITY = null;
 async function detectDestinationCapability(token) {
   if (DEST_CAPABILITY) return DEST_CAPABILITY;
@@ -233,7 +281,6 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
   if (!Array.isArray(videoIds) || !videoIds.length) return { mode:'playerOnly', map:new Map() };
   const mode = await detectDestinationCapability(token);
   const endpoint='https://analytics.api.brightcove.com/v1/data';
-
   const chunks=[]; for (let i=0;i<videoIds.length;i+=100) chunks.push(videoIds.slice(i,i+100));
   const resultMap = new Map();
   const CONCURRENCY = 4; let idx=0;
@@ -384,7 +431,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- DOWNLOAD: all-time metrics, streaming, caps, optional placements, debug ----
+// ---- DOWNLOAD: all-time metrics (hybrid), streaming, caps, optional placements, debug ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   const debug = req.query.debug === '1';
@@ -403,19 +450,15 @@ app.get('/download', async (req, res) => {
     let videos = await unifiedSearch(qInput, token).catch(e => fail('search', e));
     if (!videos.length) return res.status(404).send('No videos found for that search.');
 
-    // Cap the export to avoid 502s (proxy timeouts)
     let truncated = false;
-    if (videos.length > DOWNLOAD_MAX_VIDEOS) {
-      videos = videos.slice(0, DOWNLOAD_MAX_VIDEOS);
-      truncated = true;
-    }
+    if (videos.length > DOWNLOAD_MAX_VIDEOS) { videos = videos.slice(0, DOWNLOAD_MAX_VIDEOS); truncated = true; }
     const ids = videos.map(v => v.id);
 
-    // ALL-TIME analytics
+    // ALL-TIME (hybrid) analytics
     const analytics = await getAnalyticsForVideos(ids, token).catch(e => fail('analytics', e));
     const aMap = new Map(analytics.map(a => [String(a.video), a]));
 
-    // Placements (optional)
+    // placements (optional)
     let placementsMode = 'playerOnly', placementsMap = new Map();
     if (wantPlacements) {
       try {
@@ -426,6 +469,7 @@ app.get('/download', async (req, res) => {
       }
     }
 
+    // top summary per video
     const topSummaryByVideo = new Map();
     for (const [vid, rows] of placementsMap.entries()) {
       if (placementsMode === 'full') {
@@ -443,7 +487,7 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    // Build workbook (stream)
+    // build workbook (stream)
     const wb = new ExcelJS.Workbook();
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     const summaryHeader = (wantPlacements && placementsMode==='full')
@@ -461,18 +505,14 @@ app.get('/download', async (req, res) => {
       { header: 'Tags', key: 'tags', width: 40 },
       { header: summaryHeader, key: 'placementsSummary', width: 70 },
     ];
-
-    // If truncated, write a banner row
-    if (truncated) {
-      ws.addRow({ id: 'NOTE', title: `Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items to avoid 502 timeouts.` });
-      ws.addRow({});
-    }
+    if (truncated) { ws.addRow({ id: 'NOTE', title: `Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` }); ws.addRow({}); }
 
     const now = Date.now();
     for (const v of videos) {
       const a = aMap.get(String(v.id)) || {};
       const title = v.name || a.video_name || 'Untitled';
-      const views = a.video_view || 0;
+      const views = a.video_view || 0; // now guaranteed all-time via hybrid
+
       const basis = v.published_at || v.created_at;
       let daysSince = 1;
       if (basis) {
@@ -480,6 +520,7 @@ app.get('/download', async (req, res) => {
         if (!Number.isNaN(ts)) daysSince = Math.max(1, Math.ceil((now - ts) / 86400000));
       }
       const dailyAvgViews = Number(((views || 0) / daysSince).toFixed(2));
+
       const top = topSummaryByVideo.get(String(v.id)) || [];
       const placementsCell = (wantPlacements && top.length)
         ? (placementsMode === 'full' ? top.map(d => `${d.url} · ${d.views}`).join('; ')
@@ -511,10 +552,10 @@ app.get('/download', async (req, res) => {
           { header: 'Full URL (protocol-relative)', key: 'url', width: 60 },
           { header: `Views (${PLACEMENTS_WINDOW})`, key: 'views', width: 18 },
         ];
-        for (const vid of ids) {
-          const rows = placementsMap.get(String(vid)) || [];
+        for (const vId of ids) {
+          const rows = (placementsMap.get(String(vId)) || []);
           for (const r of rows) {
-            wp.addRow({ video: vid, player: r.player || '(unknown)', domain: r.domain || '(none)', path: r.path || '(none)', url: r.url, views: r.views || 0 });
+            wp.addRow({ video: vId, player: r.player || '(unknown)', domain: r.domain || '(none)', path: r.path || '(none)', url: r.url, views: r.views || 0 });
           }
         }
       } else {
@@ -524,10 +565,10 @@ app.get('/download', async (req, res) => {
           { header: 'Player ID', key: 'player', width: 28 },
           { header: `Views (${PLACEMENTS_WINDOW})`, key: 'views', width: 18 },
         ];
-        for (const vid of ids) {
-          const rows = placementsMap.get(String(vid)) || [];
+        for (const vId of ids) {
+          const rows = (placementsMap.get(String(vId)) || []);
           for (const r of rows) {
-            wp.addRow({ video: vid, player: r.player || '(unknown)', views: r.views || 0 });
+            wp.addRow({ video: vId, player: r.player || '(unknown)', views: r.views || 0 });
           }
         }
       }
@@ -548,11 +589,10 @@ app.get('/download', async (req, res) => {
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 app.use((req, res) => res.status(404).send('Not found'));
 
-// ---- START with relaxed timeouts (if you control Node process) ----
+// ---- START (extend timeouts for big exports) ----
 const server = app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
-// Increase timeouts to survive big exports (adjust to your platform)
-server.keepAliveTimeout = 120000;   // 120s
-server.headersTimeout   = 125000;   // must be > keepAliveTimeout
-server.requestTimeout   = 0;        // disable per-request timeout (node >=18)
+server.keepAliveTimeout = 120000;
+server.headersTimeout   = 125000;
+server.requestTimeout   = 0;
