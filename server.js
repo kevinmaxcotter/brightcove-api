@@ -673,48 +673,73 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- DOWNLOAD: ALL-TIME METRICS + PLACEMENTS ----
+// ---- DOWNLOAD: ALL-TIME METRICS + PLACEMENTS (streaming + debug) ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
+  const debug = req.query.debug === '1';
   if (!qInput) return res.status(400).send('Missing search terms');
 
-  try {
-    const token  = await getAccessToken();
-    const videos = await unifiedSearch(qInput, token);
-    if (!videos.length) return res.status(404).send('No videos found for that search.');
+  // helper to short-circuit with JSON diagnostics if debug=1
+  const dbgFail = (step, err) => {
+    const status = err?.response?.status || 500;
+    const body = err?.response?.data || err?.message || String(err);
+    if (debug) return res.status(500).json({ step, status, body });
+    throw err;
+  };
 
+  try {
+    const token  = await getAccessToken().catch(e => dbgFail('oauth', e) );
+
+    // Search
+    const videos = await unifiedSearch(qInput, token).catch(e => dbgFail('search', e) );
+    if (!videos.length) return res.status(404).send('No videos found for that search.');
     const ids = videos.map(v => v.id);
 
     // ALL-TIME analytics
-    const analytics = await getAnalyticsForVideos(ids, token);
+    let analytics = [];
+    try {
+      analytics = await getAnalyticsForVideos(ids, token);
+    } catch (e) {
+      return dbgFail('analytics', e);
+    }
     const aMap = new Map(analytics.map(a => [String(a.video), a]));
 
-    // Placements (defaults to all-time window)
-    const { mode: placementsMode, map: placementsMap } =
-      await getPlacementsForVideos(ids, token, { from: PLACEMENTS_WINDOW, to: 'now' });
+    // Placements (all-time window by default, with auto fallback)
+    let placementsMode = 'playerOnly', placementsMap = new Map();
+    try {
+      const { mode, map } = await getPlacementsForVideos(ids, token, { from: PLACEMENTS_WINDOW, to: 'now' });
+      placementsMode = mode; placementsMap = map;
+    } catch (e) {
+      // don’t kill the export; continue without placements
+      if (debug) console.warn('[placements]', e.response?.status, e.response?.data || e.message);
+      placementsMode = 'playerOnly'; placementsMap = new Map();
+    }
 
-    // Top summary per video
+    // Build top-summary per video
     const topSummaryByVideo = new Map();
     for (const [vid, rows] of placementsMap.entries()) {
       if (placementsMode === 'full') {
         const byUrl = new Map();
         for (const r of rows) byUrl.set(r.url, (byUrl.get(r.url) || 0) + (r.views || 0));
-        const top = Array.from(byUrl.entries()).map(([url, views]) => ({ url, views }))
-          .sort((a, b) => b.views - a.views).slice(0, 5);
+        const top = Array.from(byUrl.entries())
+          .map(([url, views]) => ({ url, views }))
+          .sort((a, b) => b.views - a.views)
+          .slice(0, 5);
         topSummaryByVideo.set(String(vid), top);
       } else {
         const byPlayer = new Map();
         for (const r of rows) byPlayer.set(r.player, (byPlayer.get(r.player) || 0) + (r.views || 0));
-        const top = Array.from(byPlayer.entries()).map(([player, views]) => ({ player, views }))
-          .sort((a, b) => b.views - a.views).slice(0, 5);
+        const top = Array.from(byPlayer.entries())
+          .map(([player, views]) => ({ player, views }))
+          .sort((a, b) => b.views - a.views)
+          .slice(0, 5);
         topSummaryByVideo.set(String(vid), top);
       }
     }
 
-    // Workbook
+    // Build workbook (ALL-TIME metrics)
     const wb = new ExcelJS.Workbook();
 
-    // Sheet 1: Summary — ALL-TIME metrics
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     const summaryHeader = placementsMode === 'full'
       ? `Top Destinations (${PLACEMENTS_WINDOW} · URL · views)`
@@ -738,7 +763,7 @@ app.get('/download', async (req, res) => {
       const title = v.name || a.video_name || 'Untitled';
       const views = a.video_view || 0; // ALL-TIME
 
-      // daily avg from first public timestamp (published_at preferred)
+      // daily avg from published_at (fallback created_at)
       const basis = v.published_at || v.created_at;
       let daysSince = 1;
       if (basis) {
@@ -759,16 +784,16 @@ app.get('/download', async (req, res) => {
         title,
         views,
         dailyAvgViews,
-        impressions: a.video_impression || 0,     // ALL-TIME
-        engagement: a.engagement_score || 0,      // ALL-TIME
-        playRate: a.play_rate || 0,               // ALL-TIME
+        impressions: a.video_impression || 0,       // ALL-TIME
+        engagement: a.engagement_score || 0,        // ALL-TIME
+        playRate: a.play_rate || 0,                 // ALL-TIME
         secondsViewed: a.video_seconds_viewed || 0, // ALL-TIME
         tags: (v.tags || []).join(', '),
         placementsSummary: placementsCell
       });
     }
 
-    // Sheet 2: Placements detail
+    // Sheet 2: Placements
     if (placementsMode === 'full') {
       const wp = wb.addWorksheet('Placements by Video');
       wp.columns = [
@@ -782,14 +807,7 @@ app.get('/download', async (req, res) => {
       for (const vid of ids) {
         const rows = placementsMap.get(String(vid)) || [];
         for (const r of rows) {
-          wp.addRow({
-            video: vid,
-            player: r.player || '(unknown)',
-            domain: r.domain || '(none)',
-            path: r.path || '(none)',
-            url: r.url,
-            views: r.views || 0
-          });
+          wp.addRow({ video: vid, player: r.player || '(unknown)', domain: r.domain || '(none)', path: r.path || '(none)', url: r.url, views: r.views || 0 });
         }
       }
     } else {
@@ -802,23 +820,24 @@ app.get('/download', async (req, res) => {
       for (const vid of ids) {
         const rows = placementsMap.get(String(vid)) || [];
         for (const r of rows) {
-          wp.addRow({
-            video: vid,
-            player: r.player || '(unknown)',
-            views: r.views || 0
-          });
+          wp.addRow({ video: vid, player: r.player || '(unknown)', views: r.views || 0 });
         }
       }
     }
 
-    const buffer = await wb.xlsx.writeBuffer();
+    // STREAM the XLSX (most robust across Node versions)
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Length', buffer.length);
-    return res.status(200).end(buffer);
+
+    await wb.xlsx.write(res)  // write directly to the response stream
+      .catch(e => dbgFail('excel-write', e));
+
+    // Important: end the response after streaming
+    return res.end();
 
   } catch (err) {
-    console.error('[download] fatal', err.response?.status, err.response?.data || err.message);
+    // final safety net
+    console.error('[download] fatal', err?.response?.status, err?.response?.data || err?.message || String(err));
     return res.status(500).send('Error generating spreadsheet.');
   }
 });
