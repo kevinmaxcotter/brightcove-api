@@ -1,53 +1,86 @@
-// server.js — export never 500s: errors go into an "Errors" sheet; hybrid all-time metrics; placements opt-in; streaming
+// server.js — Brightcove Tools + Sitemap-based Embed Scanner
+// Features:
+// - Search (id:, tag:, title:), recent uploads, light/dark toggle
+// - All-time analytics export (hybrid: /v1/data + /v1/alltime fallback for views)
+// - Optional placements (off by default)
+// - Streaming XLSX, keep-alive, 502 hardening, never-500 export (errors sheet)
+// - NEW: Sitemap-based scanner finds page URLs where VIDEO_ID appears (no view counts)
+//
+// .env knobs (with safe defaults):
+//   BRIGHTCOVE_ACCOUNT_ID=...
+//   BRIGHTCOVE_CLIENT_ID=...
+//   BRIGHTCOVE_CLIENT_SECRET=...
+//   BRIGHTCOVE_PLAYER_ID=...
+//   PORT=3000
+//   RECENT_LIMIT=9
+//   DOWNLOAD_MAX_VIDEOS=400
+//   PLACEMENTS_ENABLED=false
+//   PLACEMENTS_WINDOW=alltime
+//   SEARCH_ACTIVE_ONLY=false
+//   CMS_HARD_CAP_ALLPAGES=20000
+//   NAME_MAX_PAGES=5
+//   NAME_TIME_BUDGET_MS=8000
+//   SCAN_ENABLED=true
+//   SCAN_DOMAINS=www.pega.com,community.pega.com,academy.pega.com,support.pega.com
+//   SCAN_MAX_PAGES=2000
+//   SCAN_CONCURRENCY=8
+//   SCAN_TIMEOUT_MS=12000
+//   SCAN_USER_AGENT=Brightcove-Embed-Scanner/1.0
+
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
 const ExcelJS = require('exceljs');
 const http = require('http');
 const https = require('https');
+const zlib = require('zlib');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// ---- ENV CHECKS ----
+/* -------------------- ENV CHECKS -------------------- */
 const MUST = ['BRIGHTCOVE_ACCOUNT_ID','BRIGHTCOVE_CLIENT_ID','BRIGHTCOVE_CLIENT_SECRET','BRIGHTCOVE_PLAYER_ID'];
 const missing = MUST.filter(k => !process.env[k]);
 if (missing.length) { console.error('Missing .env keys:', missing.join(', ')); process.exit(1); }
 
-// ---- CONFIG ----
+/* -------------------- CONFIG -------------------- */
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 
-// Keep exports snappy
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
 
-// Placements OFF by default (enable per request with ?placements=1)
 const PLACEMENTS_ENABLED = String(process.env.PLACEMENTS_ENABLED || 'false').toLowerCase() === 'true';
 const PLACEMENTS_WINDOW = process.env.PLACEMENTS_WINDOW || 'alltime';
 
-// Search scope
 const SEARCH_ACTIVE_ONLY = String(process.env.SEARCH_ACTIVE_ONLY || 'false').toLowerCase() === 'true';
 
-// CMS paging
 const CMS_PAGE_LIMIT = 100;
 const CMS_HARD_CAP_ALLPAGES = Number(process.env.CMS_HARD_CAP_ALLPAGES || 20000);
 
-// Title-search budget
 const NAME_MAX_PAGES = Number(process.env.NAME_MAX_PAGES || 5);
 const NAME_TIME_BUDGET_MS = Number(process.env.NAME_TIME_BUDGET_MS || 8000);
 
-// ---- MIDDLEWARE ----
+/* ---- Scanner knobs (sitemap-based) ---- */
+const SCAN_ENABLED = String(process.env.SCAN_ENABLED || 'true').toLowerCase() === 'true';
+const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || 'www.pega.com,community.pega.com,academy.pega.com,support.pega.com')
+  .split(',').map(s => s.trim()).filter(Boolean);
+const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 2000);
+const SCAN_CONCURRENCY = Number(process.env.SCAN_CONCURRENCY || 8);
+const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 12000);
+const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.0 (+contact site admin)';
+
+/* -------------------- MIDDLEWARE -------------------- */
 app.use(express.urlencoded({ extended: true }));
 app.use(express.json());
 app.use(express.static('public'));
 
-// ---- KEEP-ALIVE AXIOS ----
+/* -------------------- AXIOS (keep-alive) -------------------- */
 const httpAgent  = new http.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
 const httpsAgent = new https.Agent({ keepAlive: true, maxSockets: 50, maxFreeSockets: 10 });
 const axiosInstance = axios.create({ timeout: 15000, httpAgent, httpsAgent });
 
-// ---- HELPERS ----
+/* -------------------- HELPERS -------------------- */
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
   let last; for (let i=0;i<tries;i++){ try { return await fn(); }
@@ -56,11 +89,11 @@ async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
       if (!retriable || i===tries-1) throw err; await sleep(baseDelay*Math.pow(2,i)); } }
   throw last;
 }
-const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39'}[m]));
+const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 const esc = s => String(s).replace(/"/g, '\\"');
 
-// ---- TOKEN CACHE ----
+/* -------------------- TOKEN CACHE -------------------- */
 let tokenCache = { access_token: null, expires_at: 0 };
 async function getAccessToken() {
   const now = Date.now();
@@ -76,7 +109,7 @@ async function getAccessToken() {
   return tokenCache.access_token;
 }
 
-// ---- QUERY PARSER ----
+/* -------------------- QUERY PARSER -------------------- */
 function parseQuery(input) {
   const raw = String(input || '').split(',').map(s=>s.trim()).filter(Boolean);
   const ids = [], tagTerms = [], titleTerms = [];
@@ -97,7 +130,7 @@ function parseQuery(input) {
   return { ids, tagTerms, titleTerms };
 }
 
-// ---- CMS HELPERS ----
+/* -------------------- CMS HELPERS -------------------- */
 async function cmsSearch(q, token, { limit = CMS_PAGE_LIMIT, offset = 0, sort = '-created_at' } = {}) {
   const url = `https://cms.api.brightcove.com/v1/accounts/${AID}/videos`;
   const fields = 'id,name,images,tags,state,created_at,published_at';
@@ -133,7 +166,7 @@ async function fetchVideoById(id, token) {
   return data;
 }
 
-// ---- RECENT UPLOADS ----
+/* -------------------- RECENT UPLOADS -------------------- */
 async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
   const scope = SEARCH_ACTIVE_ONLY ? 'state:ACTIVE' : '';
   const list = await cmsSearch(scope, token, { limit, sort:'-created_at', offset:0 });
@@ -143,7 +176,7 @@ async function fetchRecentUploads(token, limit = RECENT_LIMIT) {
   }));
 }
 
-// ---- UNIFIED SEARCH ----
+/* -------------------- UNIFIED SEARCH -------------------- */
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
   const pool = [];
@@ -194,13 +227,13 @@ async function unifiedSearch(input, token) {
   return list;
 }
 
-// ---- ALL-TIME ANALYTICS (hybrid) ----
+/* -------------------- ANALYTICS (HYBRID ALL-TIME) -------------------- */
 async function getAnalyticsForVideos(videoIds, token, errors) {
   if (!Array.isArray(videoIds) || !videoIds.length) return [];
   const endpoint = 'https://analytics.api.brightcove.com/v1/data';
   const fields = ['video','video_name','video_view','video_impression','play_rate','engagement_score','video_seconds_viewed'].join(',');
 
-  // step 1: batch pull
+  // batch /v1/data
   const chunks = []; for (let i=0;i<videoIds.length;i+=100) chunks.push(videoIds.slice(i,i+100));
   const out = []; const CONCURRENCY = 5; let idx = 0;
   async function worker() {
@@ -217,14 +250,14 @@ async function getAnalyticsForVideos(videoIds, token, errors) {
         );
         out.push(...(data?.items || []));
       } catch (e) {
-        errors.push({ step: 'analytics-batch', ids: batch.join(','), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
+        errors && errors.push({ step: 'analytics-batch', ids: batch.join(','), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
       }
     }
   }
   await Promise.all(Array.from({length:Math.min(CONCURRENCY,chunks.length)}, worker));
   const byId = new Map(out.map(i => [String(i.video), i]));
 
-  // step 2: per-video fallback for views if missing/zero
+  // fallback /v1/alltime if views missing/0
   const needFallback = videoIds.filter(id => {
     const row = byId.get(String(id));
     return !row || !row.video_view || row.video_view === 0;
@@ -244,7 +277,7 @@ async function getAnalyticsForVideos(videoIds, token, errors) {
         existing.video_view = Math.max(Number(existing.video_view || 0), Number(views || 0));
         byId.set(key, existing);
       } catch (e) {
-        errors.push({ step: 'analytics-fallback-alltime', id: String(vid), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
+        errors && errors.push({ step: 'analytics-fallback-alltime', id: String(vid), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
       }
     }
   }
@@ -253,7 +286,7 @@ async function getAnalyticsForVideos(videoIds, token, errors) {
   return videoIds.map(id => byId.get(String(id)) || { video: String(id) });
 }
 
-// ---- PLACEMENTS (optional; auto-detect) ----
+/* -------------------- PLACEMENTS (OPTIONAL) -------------------- */
 let DEST_CAPABILITY = null;
 async function detectDestinationCapability(token) {
   if (DEST_CAPABILITY) return DEST_CAPABILITY;
@@ -296,7 +329,7 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
           }
         }
       } catch (e) {
-        errors.push({ step: 'placements-batch', ids: batch.join(','), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
+        errors && errors.push({ step: 'placements-batch', ids: batch.join(','), status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
       }
     }
   }
@@ -324,7 +357,7 @@ async function getPlacementsForVideos(videoIds, token, { from = PLACEMENTS_WINDO
   return out;
 }
 
-// ---- THEME (shared CSS + JS) ----
+/* -------------------- THEME -------------------- */
 function themeHead(){ return `
   <style>
     :root{ --bg:#0b0b0d; --panel:#121217; --border:#262633; --text:#e9eef5; --muted:#9aa3af; --chip:#1a1a22; --chipBorder:#2a2a3a; --link:#7cc5ff; --btn:#14b8a6; --btnText:#031313; --btnHover:#10a195; }
@@ -362,7 +395,7 @@ function themeToggleButton(){ return `
     render(cur()); b.addEventListener('click',function(){var n=cur()==='dark'?'light':'dark';document.documentElement.setAttribute('data-theme',n);try{localStorage.setItem('theme',n);}catch(e){}render(n);}); })();</script>
 `; }
 
-// ---- UI: HOME ----
+/* -------------------- UI: HOME -------------------- */
 app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
   try {
@@ -395,7 +428,7 @@ app.get('/', async (req, res) => {
   }
 });
 
-// ---- UI: SEARCH ----
+/* -------------------- UI: SEARCH -------------------- */
 app.get('/search', async (req, res) => {
   const qInput = (req.query.q || '').trim(); if (!qInput) return res.redirect('/');
   try {
@@ -425,17 +458,180 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- DOWNLOAD: all-time metrics (hybrid) — ALWAYS returns a file; errors go to "Errors" sheet ----
+/* -------------------- SITEMAP SCANNER -------------------- */
+// fetch text (with gzip/deflate support)
+async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
+  const res = await axios.get(url, {
+    timeout: timeoutMs,
+    responseType: 'arraybuffer',
+    headers: { 'User-Agent': SCAN_USER_AGENT, 'Accept-Encoding': 'gzip,deflate' },
+    httpAgent, httpsAgent, validateStatus: s => s >= 200 && s < 400
+  });
+  let buf = res.data;
+  const enc = (res.headers['content-encoding'] || '').toLowerCase();
+  if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
+  else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
+  return buf.toString('utf8');
+}
+
+// parse <loc>...</loc> from a sitemap or sitemap-index (very lightweight)
+function parseSitemapLocs(xmlText) {
+  const locs = [];
+  const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi;
+  let m; while ((m = re.exec(xmlText))) { locs.push(m[1]); }
+  return locs;
+}
+
+// normalize/keep only http(s) and limit to our domains
+function urlAllowed(u, domainsSet) {
+  try {
+    const x = new URL(u);
+    if (!/^https?:$/.test(x.protocol)) return false;
+    const host = x.hostname.toLowerCase();
+    for (const d of domainsSet) {
+      if (host === d || host.endsWith('.' + d)) return true;
+    }
+    return false;
+  } catch { return false; }
+}
+
+// Discover pages via sitemap.xml (+ handle index files)
+async function discoverPagesFromSitemaps(domains, maxPagesTotal) {
+  const domainsSet = new Set(domains.map(d => d.toLowerCase()));
+  const seenSitemaps = new Set();
+  const pages = new Set();
+  async function fetchSite(domain) {
+    const base = `https://${domain}`;
+    const main = `${base}/sitemap.xml`;
+    try {
+      const xml = await fetchText(main);
+      await processSitemap(main, xml);
+    } catch (e) {
+      console.warn('[sitemap] failed', main, e.message);
+    }
+  }
+  async function processSitemap(sitemapUrl, xml) {
+    if (seenSitemaps.has(sitemapUrl) || pages.size >= maxPagesTotal) return;
+    seenSitemaps.add(sitemapUrl);
+    const locs = parseSitemapLocs(xml);
+    // Heuristic: if many locs end with .xml => it's an index
+    const xmlLocs = locs.filter(u => /\.xml(\.gz)?$/i.test(u));
+    if (xmlLocs.length && xmlLocs.length >= locs.length * 0.5) {
+      for (const u of xmlLocs) {
+        if (pages.size >= maxPagesTotal) break;
+        if (!urlAllowed(u, domainsSet)) continue;
+        try {
+          const xml2 = await fetchText(u);
+          await processSitemap(u, xml2);
+        } catch (e) {
+          console.warn('[sitemap] sub failed', u, e.message);
+        }
+      }
+    } else {
+      for (const u of locs) {
+        if (pages.size >= maxPagesTotal) break;
+        if (!urlAllowed(u, domainsSet)) continue;
+        pages.add(u);
+      }
+    }
+  }
+
+  await Promise.allSettled(domains.map(fetchSite));
+  return Array.from(pages);
+}
+
+// Scan a single page for given video IDs; return matches [{url, id, snippet}]
+async function scanPageForIds(pageUrl, videoIds) {
+  try {
+    const html = await fetchText(pageUrl);
+    const matches = [];
+    for (const vid of videoIds) {
+      // common patterns: iframe player URL query, data attributes, serialized json
+      const patterns = [
+        new RegExp(`videoId=${vid}(?:[^0-9]|$)`,'i'),
+        new RegExp(`data-video-id=["']${vid}["']`,'i'),
+        new RegExp(`data-brightcove-video-id=["']${vid}["']`,'i'),
+        new RegExp(`"videoId"\\s*:\\s*["']${vid}["']`,'i'),
+        new RegExp(`data-experience-video-id=["']${vid}["']`,'i'),
+      ];
+      for (const rx of patterns) {
+        const m = html.match(rx);
+        if (m) {
+          // build tiny snippet around match
+          const idx = m.index || 0;
+          const start = Math.max(0, idx - 60);
+          const end = Math.min(html.length, idx + 60);
+          const snippet = html.slice(start, end).replace(/\s+/g,' ').slice(0,120);
+          matches.push({ url: pageUrl, id: String(vid), snippet });
+          break; // one match per vid per page is enough
+        }
+      }
+    }
+    return matches;
+  } catch {
+    return [];
+  }
+}
+
+// Run the sitemap-based scan (polite concurrency)
+async function runSitemapScan(videoIds, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX_PAGES, concurrency = SCAN_CONCURRENCY } = {}) {
+  if (!domains.length || !videoIds.length) return { matches: [], pagesTotal: 0 };
+  const pages = await discoverPagesFromSitemaps(domains, maxPages);
+  let i = 0;
+  const out = [];
+  async function worker() {
+    while (i < pages.length) {
+      const my = i++;
+      const pageUrl = pages[my];
+      const found = await scanPageForIds(pageUrl, videoIds);
+      if (found.length) out.push(...found);
+    }
+  }
+  const workers = Array.from({length: Math.min(concurrency, pages.length)}, worker);
+  await Promise.all(workers);
+  return { matches: out, pagesTotal: pages.length };
+}
+
+/* -------------------- API: /scan (JSON) -------------------- */
+app.get('/scan', async (req, res) => {
+  if (!SCAN_ENABLED) return res.status(403).json({ error: 'Scanning disabled by server.' });
+  const qInput = (req.query.q || '').trim();
+  if (!qInput) return res.status(400).json({ error: 'Missing q' });
+
+  try {
+    const token = await getAccessToken();
+    const videos = await unifiedSearch(qInput, token);
+    const ids = videos.map(v => v.id);
+    if (!ids.length) return res.json({ pages: 0, results: {} });
+
+    const { matches, pagesTotal } = await runSitemapScan(ids);
+    const map = {};
+    for (const m of matches) {
+      if (!map[m.id]) map[m.id] = [];
+      map[m.id].push({ url: m.url, snippet: m.snippet });
+    }
+    // de-dupe urls per id
+    for (const k of Object.keys(map)) {
+      const seen = new Set();
+      map[k] = map[k].filter(x => { const key = x.url; if (seen.has(key)) return false; seen.add(key); return true; });
+    }
+    res.json({ pages: pagesTotal, results: map });
+  } catch (e) {
+    console.error('scan error', e.message);
+    res.status(500).json({ error: 'scan failed' });
+  }
+});
+
+/* -------------------- DOWNLOAD (ALWAYS returns a file) -------------------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   const wantPlacements = req.query.placements ? req.query.placements === '1' : PLACEMENTS_ENABLED;
+  const wantScan = req.query.scan ? req.query.scan === '1' : SCAN_ENABLED;
   if (!qInput) return res.status(400).send('Missing search terms');
 
-  // a place to collect diagnostics that will be written to the "Errors" sheet
   const errors = [];
-
-  // build workbook up-front so we can always return a file
   const wb = new ExcelJS.Workbook();
+
   const ws = wb.addWorksheet('Video Metrics (All-Time)');
   ws.columns = [
     { header: 'Video ID', key: 'id', width: 20 },
@@ -473,7 +669,7 @@ app.get('/download', async (req, res) => {
 
       ids = videos.map(v => v.id);
 
-      // analytics (hybrid all-time)
+      // analytics (hybrid)
       let analytics = [];
       try {
         analytics = await getAnalyticsForVideos(ids, token, errors);
@@ -512,13 +708,12 @@ app.get('/download', async (req, res) => {
         }
       }
 
-      // fill summary rows
+      // summary rows
       const now = Date.now();
       for (const v of videos) {
         const a = aMap.get(String(v.id)) || {};
         const title = v.name || a.video_name || 'Untitled';
         const views = a.video_view || 0;
-
         const basis = v.published_at || v.created_at;
         let daysSince = 1;
         if (basis) {
@@ -547,12 +742,37 @@ app.get('/download', async (req, res) => {
           placementsSummary: placementsCell
         });
       }
+
+      // ---- Embeds Found sheet (sitemap scan) ----
+      if (wantScan) {
+        try {
+          const { matches, pagesTotal } = await runSitemapScan(ids);
+          const wf = wb.addWorksheet('Embeds Found');
+          wf.columns = [
+            { header: 'Video ID', key: 'id', width: 20 },
+            { header: 'Page URL', key: 'url', width: 80 },
+            { header: 'Match Snippet', key: 'snippet', width: 60 },
+          ];
+          // de-dupe (id,url)
+          const dedupe = new Set();
+          for (const m of matches) {
+            const key = `${m.id}|${m.url}`;
+            if (dedupe.has(key)) continue;
+            dedupe.add(key);
+            wf.addRow({ id: m.id, url: m.url, snippet: m.snippet || '' });
+          }
+          // note row
+          wf.addRow({});
+          wf.addRow({ id: 'INFO', url: `Scanned ~${pagesTotal} pages across: ${SCAN_DOMAINS.join(', ')}` });
+        } catch (e) {
+          errors.push({ step: 'scan', status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
+        }
+      }
     }
   } catch (e) {
     errors.push({ step: 'fatal', status: e?.response?.status || 'ERR', detail: e?.response?.data || e.message });
   }
 
-  // Errors sheet (only if we captured anything)
   if (errors.length) {
     const we = wb.addWorksheet('Errors');
     we.columns = [
@@ -564,28 +784,17 @@ app.get('/download', async (req, res) => {
     for (const e of errors) we.addRow({ step: e.step, ids: e.ids || e.id || '', status: e.status, detail: typeof e.detail === 'string' ? e.detail : JSON.stringify(e.detail) });
   }
 
-  // STREAM the XLSX (never throw here)
   res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
   res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-  try {
-    await wb.xlsx.write(res);
-  } catch (e) {
-    // last-ditch: send a tiny CSV so the request still completes
-    try {
-      const csv = 'error\nExcel write failed; see server logs\n';
-      res.setHeader('Content-Type', 'text/csv; charset=utf-8');
-      res.setHeader('Content-Disposition', 'attachment; filename=export_error.csv');
-      res.write(csv);
-    } catch (_) {}
-  }
+  try { await wb.xlsx.write(res); } catch { /* fall through */ }
   return res.end();
 });
 
-// ---- HEALTH + NOT FOUND ----
+/* -------------------- HEALTH + NOT FOUND -------------------- */
 app.get('/healthz', (_req, res) => res.status(200).send('ok'));
 app.use((req, res) => res.status(404).send('Not found'));
 
-// ---- START (extend timeouts for big exports) ----
+/* -------------------- START -------------------- */
 const server = app.listen(PORT, () => {
   console.log(`Server running at http://localhost:${PORT}`);
 });
