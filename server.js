@@ -219,7 +219,7 @@ async function getAnalyticsForVideos(videoIds, token) {
   return out;
 }
 
-// ---- DESTINATIONS (domain + path -> full URL) ----
+// ---- DESTINATIONS (domain + path -> protocol-relative URL) ----
 async function getDestinationsForVideos(videoIds, token, { from = 'alltime', to = 'now', topN = 5 } = {}) {
   if (!Array.isArray(videoIds) || videoIds.length === 0) return new Map();
 
@@ -230,7 +230,7 @@ async function getDestinationsForVideos(videoIds, token, { from = 'alltime', to 
   const endpoint = 'https://analytics.api.brightcove.com/v1/data';
   const fields = ['video', 'destination_domain', 'destination_path', 'video_view'].join(',');
 
-  // Map<videoId, Map<url, views>>
+  // Map<videoId, Map<url, {views, domain, path}>>
   const accum = new Map();
 
   for (const batch of chunks) {
@@ -250,16 +250,18 @@ async function getDestinationsForVideos(videoIds, token, { from = 'alltime', to 
           timeout: 30000
         });
 
-        const items = data?.items || [];
+        const items = (data && data.items) || [];
         for (const row of items) {
           const vid = String(row.video);
           const domain = (row.destination_domain || '').trim();
           const path = (row.destination_path || '').trim();
+          const url = domain ? `//${domain}${path.startsWith('/') ? path : (path ? '/' + path : '')}` : '(unknown)';
+          const views = row.video_view || 0;
 
           if (!accum.has(vid)) accum.set(vid, new Map());
-          const url = domain ? `https://${domain}${path.startsWith('/') ? path : (path ? '/' + path : '')}` : '(unknown)';
-          const cur = accum.get(vid).get(url) || 0;
-          accum.get(vid).set(url, cur + (row.video_view || 0));
+          const cur = accum.get(vid).get(url) || { views: 0, domain, path };
+          cur.views += views;
+          accum.get(vid).set(url, cur);
         }
         break; // success
       } catch (err) {
@@ -273,11 +275,11 @@ async function getDestinationsForVideos(videoIds, token, { from = 'alltime', to 
     }
   }
 
-  // Map<videoId, Array<{url, views}>> sorted & limited
+  // Map<videoId, Array<{url, domain, path, views}>> sorted & limited
   const finalMap = new Map();
   for (const [vid, urlMap] of accum.entries()) {
     const rows = Array.from(urlMap.entries())
-      .map(([url, views]) => ({ url, views }))
+      .map(([url, obj]) => ({ url, ...obj }))
       .sort((a, b) => b.views - a.views)
       .slice(0, topN);
     finalMap.set(vid, rows);
@@ -537,7 +539,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-// ---- SPREADSHEET EXPORT (with Top Destinations) ----
+// ---- SPREADSHEET EXPORT (with full Destinations data) ----
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -571,6 +573,8 @@ app.get('/download', async (req, res) => {
       { header: 'Seconds Viewed', key: 'secondsViewed', width: 18 },
       { header: 'Tags', key: 'tags', width: 40 },
       { header: 'Top Destinations (URL · views)', key: 'destinations', width: 60 },
+      { header: 'Destination Domains', key: 'domains', width: 40 },
+      { header: 'Destination Paths', key: 'paths', width: 40 },
     ];
 
     const now = Date.now();
@@ -578,10 +582,10 @@ app.get('/download', async (req, res) => {
       const a = aMap.get(String(v.id)) || {};
       const title = v.name || a.video_name || 'Untitled';
 
-      // Prefer analytics video_view if we didn't separately pull alltime views endpoint
+      // Prefer analytics video_view as all-time proxy here
       const views = a.video_view || 0;
 
-      // daily avg based on created_at available from search list
+      // daily avg based on created_at
       let daysSince = 1;
       if (v.created_at) {
         const ts = new Date(v.created_at).getTime();
@@ -593,6 +597,8 @@ app.get('/download', async (req, res) => {
       const destinationsCell = destRows.length
         ? destRows.map(d => `${d.url} · ${d.views}`).join('; ')
         : '—';
+      const domainsCell = destRows.length ? destRows.map(d => d.domain || '(none)').join('; ') : '—';
+      const pathsCell = destRows.length ? destRows.map(d => d.path || '(none)').join('; ') : '—';
 
       ws.addRow({
         id: v.id,
@@ -604,7 +610,9 @@ app.get('/download', async (req, res) => {
         playRate: a.play_rate || 0,
         secondsViewed: a.video_seconds_viewed || 0,
         tags: (v.tags || []).join(', '),
-        destinations: destinationsCell
+        destinations: destinationsCell,
+        domains: domainsCell,
+        paths: pathsCell
       });
     }
 
