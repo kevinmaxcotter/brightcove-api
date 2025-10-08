@@ -1,10 +1,5 @@
-// server.js — Same UI/behavior. Scanner improved to correctly find page URLs:
-// - robots.txt sitemap discovery (https + http)
-// - fallback sitemap paths (_index, .gz)
-// - brotli (br) support
-// - more ID-specific patterns (still no generic player hits)
-// - structured scan logging
-// - keeps time budgets so downloads complete reliably
+// server.js — Scanner now “deep scans” a few linked JS/JSON assets per page to catch client-side injected videoIds.
+// Everything else (UI, search, dark/light toggle, all-time metrics, time budgets) unchanged.
 
 require('dotenv').config();
 const express = require('express');
@@ -47,6 +42,11 @@ const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '')
 const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 1200);
 const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 12000);
 const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.0 (+contact site admin)';
+
+// NEW: Deep scan flags
+const SCAN_DEEP = /^true$/i.test(String(process.env.SCAN_DEEP || 'false'));
+const SCAN_MAX_ASSETS_PER_PAGE = Number(process.env.SCAN_MAX_ASSETS_PER_PAGE || 5);
+const SCAN_MAX_ASSET_BYTES = Number(process.env.SCAN_MAX_ASSET_BYTES || 300000); // ~300KB cap per asset
 
 // CMS paging
 const CMS_PAGE_LIMIT = 100;
@@ -404,9 +404,9 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Scanner (improved) ---------- */
+/* ---------- Scanner w/ deep asset search ---------- */
 
-// Small logger to summarize scan progress
+// mini logger
 function logScan(msg, extra){ try{ console.log('[scan]', msg, extra||''); }catch{} }
 
 async function fetchBinary(url, timeoutMs = SCAN_TIMEOUT_MS) {
@@ -415,7 +415,7 @@ async function fetchBinary(url, timeoutMs = SCAN_TIMEOUT_MS) {
     responseType: 'arraybuffer',
     headers: {
       'User-Agent': SCAN_USER_AGENT,
-      'Accept-Encoding': 'br,gzip,deflate' // allow brotli
+      'Accept-Encoding': 'br,gzip,deflate'
     },
     validateStatus: s => s>=200 && s<400
   }).then(r => ({ data: r.data, headers: r.headers }));
@@ -424,11 +424,11 @@ function decodeBody({ data, headers }, url) {
   let buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const enc = (headers['content-encoding'] || '').toLowerCase();
   try {
-    if (enc.includes('br'))      buf = zlib.brotliDecompressSync(buf);
-    else if (enc.includes('gzip'))   buf = zlib.gunzipSync(buf);
-    else if (enc.includes('deflate'))buf = zlib.inflateSync(buf);
-    else if (/\.gz(\?|$)/i.test(url))buf = zlib.gunzipSync(buf);
-  } catch { /* fall through with original buf */ }
+    if (enc.includes('br')) buf = zlib.brotliDecompressSync(buf);
+    else if (enc.includes('gzip')) buf = zlib.gunzipSync(buf);
+    else if (enc.includes('deflate')) buf = zlib.inflateSync(buf);
+    else if (/\.gz(\?|$)/i.test(url)) buf = zlib.gunzipSync(buf);
+  } catch { /* keep original */ }
   return buf.toString('utf8');
 }
 async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
@@ -455,7 +455,6 @@ async function discoverSitemapsForDomain(domain) {
   const cands = new Set();
   const bases = [`https://${domain}`, `http://${domain}`];
   for (const base of bases) {
-    // robots.txt
     try {
       const robots = await fetchText(`${base}/robots.txt`);
       const lines = robots.split(/\r?\n/);
@@ -464,7 +463,6 @@ async function discoverSitemapsForDomain(domain) {
         if (m && m[1]) cands.add(m[1].trim());
       }
     } catch {}
-    // common fallbacks
     cands.add(`${base}/sitemap.xml`);
     cands.add(`${base}/sitemap_index.xml`);
     cands.add(`${base}/sitemap.xml.gz`);
@@ -507,42 +505,162 @@ async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
 
 /* Only ID-specific patterns (expanded) */
 function buildPatternsForId(vid) {
-  const id = String(vid).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&'); // escape just in case
+  const id = String(vid).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
   return [
-    // Query-string and attributes
     new RegExp(`videoId=${id}(?:[^0-9]|$)`, 'i'),
     new RegExp(`data-video-id=["']${id}["']`, 'i'),
     new RegExp(`data-video-id=${id}(?:\\b|[^0-9])`, 'i'),
     new RegExp(`data-brightcove-video-id=["']${id}["']`, 'i'),
     new RegExp(`data-experience-video-id=["']${id}["']`, 'i'),
-
-    // JSON-like configs
     new RegExp(`"videoId"\\s*:\\s*["']${id}["']`, 'i'),
     new RegExp(`'videoId'\\s*:\\s*'${id}'`, 'i'),
     new RegExp(`"video_id"\\s*:\\s*["']?${id}["']?`, 'i'),
     new RegExp(`'video_id'\\s*:\\s*['"]?${id}['"]?`, 'i'),
     new RegExp(`"brightcoveVideoId"\\s*:\\s*["']${id}["']`, 'i'),
     new RegExp(`"bcVideoId"\\s*:\\s*["']${id}["']`, 'i'),
-
-    // JS inits containing the exact ID
     new RegExp(`\\bdata-video-id=${id}\\b`, 'i'),
     new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${id}["']`, 'i'),
     new RegExp(`brightcove[\\s\\S]{0,200}?["']${id}["']`, 'i'),
   ];
 }
 
+/* Extract a small set of candidate asset URLs from HTML (scripts/JSON) */
+function extractAssetUrls(pageUrl, html) {
+  const out = new Set();
+  const base = new URL(pageUrl);
+  const add = (u) => {
+    try {
+      const x = new URL(u, base);
+      // keep same-site or common asset CDNs for that site
+      if (x.hostname === base.hostname || x.hostname.endsWith('.' + base.hostname.split('.').slice(-2).join('.'))) {
+        out.add(x.toString());
+      }
+    } catch {}
+  };
+  // <script src="...">
+  html.replace(/<script[^>]+src=["']([^"']+)["'][^>]*>/gi, (_, u) => { add(u); return _; });
+  // <link rel="preload" as="script" href="...">
+  html.replace(/<link[^>]+rel=["']preload["'][^>]+as=["']script["'][^>]+href=["']([^"']+)["'][^>]*>/gi, (_, u) => { add(u); return _; });
+  // <script type="application/ld+json"> is inline; already in html text, so no need to add.
+  return Array.from(out).slice(0, SCAN_MAX_ASSETS_PER_PAGE);
+}
+
+/* Fetch at most SCAN_MAX_ASSETS_PER_PAGE assets, capped by SCAN_MAX_ASSET_BYTES each */
+async function fetchAssetSnippet(url) {
+  try {
+    const { data, headers } = await fetchBinary(url);
+    // size guard
+    const len = Number(headers['content-length'] || '0');
+    if (len && len > SCAN_MAX_ASSET_BYTES) {
+      const slice = decodeBody({ data: data.subarray(0, Math.min(data.length, SCAN_MAX_ASSET_BYTES)) , headers }, url);
+      return slice;
+    }
+    const txt = decodeBody({ data, headers }, url);
+    // explicitly truncate huge text
+    return txt.length > SCAN_MAX_ASSET_BYTES ? txt.slice(0, SCAN_MAX_ASSET_BYTES) : txt;
+  } catch {
+    return '';
+  }
+}
+
+/* Page scan: HTML first; if not found & SCAN_DEEP=true, scan a few assets too */
 async function scanPageForIds(pageUrl, ids) {
   try {
     const html = await fetchText(pageUrl);
-    const hits = [];
+    const hits = new Map(); // id -> whereFound ('html' or asset URL)
+
+    // 1) HTML
     for (const vid of ids) {
       const pats = buildPatternsForId(vid);
-      for (const rx of pats) {
-        if (rx.test(html)) { hits.push({ id: String(vid), url: pageUrl }); break; }
+      for (const rx of pats) { if (rx.test(html)) { hits.set(String(vid), 'html'); break; } }
+    }
+    if (hits.size === ids.length || !SCAN_DEEP) {
+      return Array.from(hits.entries()).map(([id]) => ({ id, url: pageUrl }));
+    }
+
+    // 2) Deep scan assets
+    const assets = extractAssetUrls(pageUrl, html);
+    for (const assetUrl of assets) {
+      if (hits.size === ids.length) break;
+      const txt = await fetchAssetSnippet(assetUrl);
+      if (!txt) continue;
+      for (const vid of ids) {
+        if (hits.has(String(vid))) continue;
+        const pats = buildPatternsForId(vid);
+        for (const rx of pats) { if (rx.test(txt)) { hits.set(String(vid), assetUrl); break; } }
       }
     }
-    return hits;
-  } catch { return []; }
+
+    return Array.from(hits.entries()).map(([id]) => ({ id, url: pageUrl }));
+  } catch {
+    return [];
+  }
+}
+
+async function discoverSitemapsForDomain(domain) {
+  const cands = new Set();
+  const bases = [`https://${domain}`, `http://${domain}`];
+  for (const base of bases) {
+    try {
+      const robots = await fetchText(`${base}/robots.txt`);
+      const lines = robots.split(/\r?\n/);
+      for (const ln of lines) {
+        const m = ln.match(/^\s*Sitemap:\s*(\S+)\s*$/i);
+        if (m && m[1]) cands.add(m[1].trim());
+      }
+    } catch {}
+    cands.add(`${base}/sitemap.xml`);
+    cands.add(`${base}/sitemap_index.xml`);
+    cands.add(`${base}/sitemap.xml.gz`);
+  }
+  return Array.from(cands);
+}
+function logScan(msg, extra){ try{ console.log('[scan]', msg, extra||''); }catch{} }
+function parseSitemapLocs(xml) {
+  const locs = [];
+  const re = /<loc>\s*([^<\s]+)\s*<\/loc>/gi; let m;
+  while ((m = re.exec(xml))) locs.push(m[1]);
+  return locs;
+}
+async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
+  const allowed = domains.map(d => d.toLowerCase());
+  const pages = new Set();
+  async function urlAllowed(u) {
+    try {
+      const x = new URL(u);
+      if (!/^https?:$/.test(x.protocol)) return false;
+      const h = x.hostname.toLowerCase();
+      for (const d of allowed) if (h===d || h.endsWith('.'+d)) return true;
+      return false;
+    } catch { return false; }
+  }
+  async function processSitemap(url) {
+    if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) return;
+    try {
+      const xml = await fetchText(url);
+      const locs = parseSitemapLocs(xml);
+      const subs = locs.filter(u => /\.xml(\.gz)?$/i.test(u));
+      if (subs.length && subs.length >= locs.length * 0.5) {
+        for (const u of subs) {
+          if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
+          if (await urlAllowed(u)) await processSitemap(u);
+        }
+      } else {
+        for (const u of locs) {
+          if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
+          if (await urlAllowed(u)) pages.add(u);
+        }
+      }
+    } catch (e) { logScan('sitemap failed', { url, err: e.message }); }
+  }
+  for (const d of domains) {
+    const sitemaps = await discoverSitemapsForDomain(d);
+    logScan('sitemaps discovered', { domain: d, count: sitemaps.length });
+    await Promise.allSettled(sitemaps.map(processSitemap));
+    logScan('pages so far', { domain: d, pages: pages.size });
+    if (pages.size >= maxPagesTotal || Date.now() >= deadlineTs) break;
+  }
+  return Array.from(pages);
 }
 
 async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX_PAGES, concurrency = SCAN_CONCURRENCY, timeBudgetMs = SCAN_TIME_BUDGET_MS } = {}) {
@@ -563,7 +681,6 @@ async function runSitemapScan(ids, { domains = SCAN_DOMAINS, maxPages = SCAN_MAX
   }
   await Promise.all(Array.from({length: Math.min(concurrency, pages.length)}, worker));
 
-  // log summary
   const totals = {}; for (const [id, set] of found.entries()) totals[id] = set.size;
   logScan('scan summary', { totals });
 
@@ -591,7 +708,6 @@ app.get('/download', async (req, res) => {
     // analytics with concurrency + deadline guard
     const rows = new Array(videos.length);
     let idxA = 0;
-
     async function metricsWorker() {
       while (Date.now() < dlDeadline && idxA < videos.length) {
         const i = idxA++; const v = videos[i];
@@ -673,6 +789,42 @@ app.get('/download', async (req, res) => {
   } catch (err) {
     console.error('Download error:', err?.response?.status, err?.response?.data || err.message);
     res.status(500).send('Error generating spreadsheet.');
+  }
+});
+
+/* ---------- Debug endpoint: see why a specific page is (not) matching ---------- */
+app.get('/debug-embed', async (req, res) => {
+  const id = (req.query.id || '').trim();
+  const url = (req.query.url || '').trim();
+  if (!looksLikeId(id) || !url) return res.status(400).send('Use /debug-embed?id=<VIDEO_ID>&url=<PAGE_URL>');
+
+  try {
+    const html = await fetchText(url);
+    const pats = buildPatternsForId(id);
+    let where = 'none';
+    for (const rx of pats) { if (rx.test(html)) { where = 'html'; break; } }
+
+    let assets = [];
+    let assetHit = null;
+
+    if (where === 'none' && SCAN_DEEP) {
+      assets = extractAssetUrls(url, html);
+      for (const a of assets) {
+        const txt = await fetchAssetSnippet(a);
+        for (const rx of pats) { if (rx.test(txt)) { assetHit = a; break; } }
+        if (assetHit) break;
+      }
+      if (assetHit) where = `asset: ${assetHit}`;
+    }
+
+    res.json({
+      videoId: id,
+      url,
+      foundIn: where,
+      assetsChecked: assets
+    });
+  } catch (e) {
+    res.status(500).send('Failed to fetch page: ' + (e?.message || 'unknown error'));
   }
 });
 
