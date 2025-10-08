@@ -1,6 +1,5 @@
-// server.js — Full app with Brotil-safe decode (fixes 502), search, metrics (all-time),
-// recent uploads, dark/light toggle, sitemap + deep asset scan for "Embedded On" URLs,
-// and a /debug-embed endpoint. UI text/structure unchanged.
+// server.js — Brightcove tools with improved embed URL discovery for Pega sites
+// UI/metrics unchanged. Scanner now deep-scans assets from *.pega.com by default.
 
 require('dotenv').config();
 const express = require('express');
@@ -20,11 +19,14 @@ process.on('uncaughtException', err => console.error('UNCAUGHT EXCEPTION:', err?
 /* ---------- env checks ---------- */
 const MUST = ['BRIGHTCOVE_ACCOUNT_ID','BRIGHTCOVE_CLIENT_ID','BRIGHTCOVE_CLIENT_SECRET','BRIGHTCOVE_PLAYER_ID'];
 const missing = MUST.filter(k => !process.env[k]);
-if (missing.length) { console.error('Missing .env keys:', missing.join(', ')); process.exit(1); }
+if (missing.length) {
+  console.error('Missing .env keys:', missing.join(', '));
+  // keep process alive so you can see UI; routes will handle error states
+}
 
 /* ---------- config ---------- */
-const AID = process.env.BRIGHTCOVE_ACCOUNT_ID;
-const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID;
+const AID = process.env.BRIGHTCOVE_ACCOUNT_ID || '';
+const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID || '';
 
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
@@ -38,16 +40,19 @@ const METRICS_CONCURRENCY = Number(process.env.METRICS_CONCURRENCY || 6);
 const SCAN_CONCURRENCY    = Number(process.env.SCAN_CONCURRENCY || 8);
 
 // Scan size/limits
-const SCAN_DOMAINS = String(process.env.SCAN_DOMAINS || '')
+const SCAN_DOMAINS = (process.env.SCAN_DOMAINS || 'community.pega.com,academy.pega.com')
   .split(',').map(s => s.trim()).filter(Boolean);
 const SCAN_MAX_PAGES = Number(process.env.SCAN_MAX_PAGES || 1200);
 const SCAN_TIMEOUT_MS = Number(process.env.SCAN_TIMEOUT_MS || 12000);
-const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.0 (+contact site admin)';
+const SCAN_USER_AGENT = process.env.SCAN_USER_AGENT || 'Brightcove-Embed-Scanner/1.1';
 
 // Deep scan flags
-const SCAN_DEEP = /^true$/i.test(String(process.env.SCAN_DEEP || 'false'));
-const SCAN_MAX_ASSETS_PER_PAGE = Number(process.env.SCAN_MAX_ASSETS_PER_PAGE || 5);
-const SCAN_MAX_ASSET_BYTES = Number(process.env.SCAN_MAX_ASSET_BYTES || 300000); // ~300KB cap per asset
+const SCAN_DEEP = /^true$/i.test(String(process.env.SCAN_DEEP || 'true')); // default ON
+// allow assets from *.pega.com by default
+const SCAN_ASSET_SUFFIXES = (process.env.SCAN_ASSET_SUFFIXES || 'pega.com')
+  .split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
+const SCAN_MAX_ASSETS_PER_PAGE = Number(process.env.SCAN_MAX_ASSETS_PER_PAGE || 6);
+const SCAN_MAX_ASSET_BYTES = Number(process.env.SCAN_MAX_ASSET_BYTES || 400000); // ~400KB cap per asset
 
 // CMS paging
 const CMS_PAGE_LIMIT = 100;
@@ -96,6 +101,7 @@ function hasAllTags(video, terms) {
 /* ---------- auth ---------- */
 let tokenCache = { access_token: null, expires_at: 0 };
 async function getAccessToken() {
+  if (!AID) throw new Error('Missing BRIGHTCOVE_ACCOUNT_ID');
   const now = Date.now();
   if (tokenCache.access_token && now < tokenCache.expires_at - 30000) return tokenCache.access_token;
   const r = await withRetry(() =>
@@ -251,7 +257,7 @@ async function getAnalyticsForVideo(videoId, token) {
   return { id: videoId, title, tags, views, dailyAvgViews, impressions, engagement, playRate, secondsViewed };
 }
 
-/* ---------- UI theme (unchanged look; working toggle) ---------- */
+/* ---------- UI (unchanged) ---------- */
 function themeHead(){ return `
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
@@ -298,6 +304,10 @@ app.get('/healthz', (_req, res) => res.send('ok'));
 /* ---------- Home ---------- */
 app.get('/', async (req, res) => {
   const qPrefill = (req.query.q || '').replace(/`/g, '\\`');
+
+  // show banner if missing envs
+  const warn = missing.length ? `<div style="background:#ffefef;border:1px solid #f5b5b5;padding:10px;border-radius:8px;color:#8b0000;margin-bottom:10px">Missing .env keys: ${missing.join(', ')}</div>` : '';
+
   let recentHTML = '';
   try {
     const token = await getAccessToken();
@@ -330,6 +340,7 @@ app.get('/', async (req, res) => {
     ${themeToggle()}
   </header>
   <main>
+    ${warn}
     <div class="card" style="max-width:520px;margin:0 auto 20px">
       <h2>🔍 Search by ID, Tag(s), or Title</h2>
       <form action="/search" method="get">
@@ -405,9 +416,8 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Scanner with deep asset search ---------- */
+/* ---------- Scanner: sitemap + deep asset scan (pega.com allow-list) ---------- */
 
-// mini logger
 function logScan(msg, extra){ try{ console.log('[scan]', msg, extra||''); }catch{} }
 
 async function fetchBinary(url, timeoutMs = SCAN_TIMEOUT_MS) {
@@ -416,13 +426,12 @@ async function fetchBinary(url, timeoutMs = SCAN_TIMEOUT_MS) {
     responseType: 'arraybuffer',
     headers: {
       'User-Agent': SCAN_USER_AGENT,
-      'Accept-Encoding': 'br,gzip,deflate' // brotli allowed; guarded below
+      'Accept-Encoding': 'br,gzip,deflate'
     },
     validateStatus: s => s>=200 && s<400
   }).then(r => ({ data: r.data, headers: r.headers }));
 }
-
-// **Brotli-safe decode** (guarded to avoid crashes on older Node runtimes)
+// Brotli-safe decode
 function decodeBody({ data, headers }, url) {
   let buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
   const enc = (headers['content-encoding'] || '').toLowerCase();
@@ -436,7 +445,7 @@ function decodeBody({ data, headers }, url) {
     } else if (/\.gz(\?|$)/i.test(url)) {
       buf = zlib.gunzipSync(buf);
     }
-  } catch { /* keep original */ }
+  } catch {}
   return buf.toString('utf8');
 }
 async function fetchText(url, timeoutMs = SCAN_TIMEOUT_MS) {
@@ -450,14 +459,14 @@ function parseSitemapLocs(xml) {
   while ((m = re.exec(xml))) locs.push(m[1]);
   return locs;
 }
-function urlAllowed(u, allowed) {
-  try {
-    const x = new URL(u);
-    if (!/^https?:$/.test(x.protocol)) return false;
-    const h = x.hostname.toLowerCase();
-    for (const d of allowed) if (h===d || h.endsWith('.'+d)) return true;
-    return false;
-  } catch { return false; }
+function hostAllowed(host, baseHost, suffixes) {
+  const h = host.toLowerCase();
+  const base = baseHost.toLowerCase();
+  if (h === base) return true;
+  const base2 = base.split('.').slice(-2).join('.');
+  if (h.endsWith('.'+base2)) return true;
+  for (const suf of suffixes) if (h === suf || h.endsWith('.'+suf)) return true;
+  return false;
 }
 async function discoverSitemapsForDomain(domain) {
   const cands = new Set();
@@ -481,6 +490,15 @@ async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
   const allowed = domains.map(d => d.toLowerCase());
   const pages = new Set();
 
+  function urlAllowed(u) {
+    try {
+      const x = new URL(u);
+      if (!/^https?:$/.test(x.protocol)) return false;
+      const h = x.hostname.toLowerCase();
+      for (const d of allowed) if (h===d || h.endsWith('.'+d)) return true;
+      return false;
+    } catch { return false; }
+  }
   async function processSitemap(url) {
     if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) return;
     try {
@@ -490,12 +508,12 @@ async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
       if (subs.length && subs.length >= locs.length * 0.5) {
         for (const u of subs) {
           if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
-          if (urlAllowed(u, allowed)) await processSitemap(u);
+          if (urlAllowed(u)) await processSitemap(u);
         }
       } else {
         for (const u of locs) {
           if (Date.now() >= deadlineTs || pages.size >= maxPagesTotal) break;
-          if (urlAllowed(u, allowed)) pages.add(u);
+          if (urlAllowed(u)) pages.add(u);
         }
       }
     } catch (e) { logScan('sitemap failed', { url, err: e.message }); }
@@ -511,7 +529,7 @@ async function discoverPagesFromSitemaps(domains, maxPagesTotal, deadlineTs) {
   return Array.from(pages);
 }
 
-/* ID-specific patterns (expanded) */
+/* ID-specific patterns (expanded a bit) */
 function buildPatternsForId(vid) {
   const id = String(vid).replace(/[-/\\^$*+?.()|[\]{}]/g, '\\$&');
   return [
@@ -527,30 +545,35 @@ function buildPatternsForId(vid) {
     new RegExp(`"brightcoveVideoId"\\s*:\\s*["']${id}["']`, 'i'),
     new RegExp(`"bcVideoId"\\s*:\\s*["']${id}["']`, 'i'),
     new RegExp(`\\bdata-video-id=${id}\\b`, 'i'),
+    // function init patterns
     new RegExp(`videojs\$begin:math:text$[^)]+\\$end:math:text$[\\s\\S]{0,200}?["']${id}["']`, 'i'),
     new RegExp(`brightcove[\\s\\S]{0,200}?["']${id}["']`, 'i'),
+    // meta & data attributes sometimes used
+    new RegExp(`<meta[^>]+content=["'][^"']*${id}[^"']*["'][^>]*>`, 'i'),
+    new RegExp(`data-bcvid=["']${id}["']`, 'i'),
   ];
 }
 
-/* Extract candidate asset URLs from HTML (scripts/JSON) */
+/* Extract candidate asset URLs from HTML (scripts/JSON) — allows *.pega.com */
 function extractAssetUrls(pageUrl, html) {
   const out = new Set();
   const base = new URL(pageUrl);
+
+  const allowHost = (h) => hostAllowed(h, base.hostname, SCAN_ASSET_SUFFIXES);
+
   const add = (u) => {
     try {
       const x = new URL(u, base);
-      // keep same-site or same org's subdomains
-      const host = x.hostname.toLowerCase();
-      const base2 = base.hostname.toLowerCase().split('.').slice(-2).join('.');
-      if (host === base.hostname.toLowerCase() || host.endsWith('.'+base2)) {
-        out.add(x.toString());
-      }
+      if (allowHost(x.hostname)) out.add(x.toString());
     } catch {}
   };
   // <script src="...">
   html.replace(/<script[^>]+src=["']([^"']+)["'][^>]*>/gi, (_, u) => { add(u); return _; });
   // <link rel="preload" as="script" href="...">
   html.replace(/<link[^>]+rel=["']preload["'][^>]+as=["']script["'][^>]+href=["']([^"']+)["'][^>]*>/gi, (_, u) => { add(u); return _; });
+  // JSON endpoints sometimes linked as <link rel="preload" as="fetch"> (allow small subset)
+  html.replace(/<link[^>]+rel=["']preload["'][^>]+as=["']fetch["'][^>]+href=["']([^"']+\\.(?:json|txt))["'][^>]*>/gi, (_, u) => { add(u); return _; });
+
   return Array.from(out).slice(0, SCAN_MAX_ASSETS_PER_PAGE);
 }
 
@@ -734,7 +757,7 @@ app.get('/download', async (req, res) => {
   }
 });
 
-/* ---------- Debug endpoint: why a specific page is (not) matching ---------- */
+/* ---------- Debug endpoint: see why a specific page matches or not ---------- */
 app.get('/debug-embed', async (req, res) => {
   const id = (req.query.id || '').trim();
   const url = (req.query.url || '').trim();
