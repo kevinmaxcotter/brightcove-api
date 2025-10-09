@@ -1,9 +1,10 @@
-// server.js — Brightcove tools with Destination Path view sources (all-time)
+// server.js — Brightcove tools with Destination Path view sources (all-time) + Debug route
 // - Home: search form + most recent uploads
 // - Results: playable cards, tags, "Download Video Analytics Spreadsheet"
-// - Spreadsheet: all-time metrics + "View Sources (URLs & Views)" from Analytics
-// - Light/Dark toggle with emojis
-// - /healthz for platform health checks
+// - Spreadsheet: all-time metrics + "View Sources (URLs & Views)" from Analytics (domain+path)
+// - Light/Dark toggle with emojis (unchanged labels)
+// - /healthz for health checks
+// - /debug-destinations?id=<VIDEO_ID> to inspect raw destination data
 //
 // Env required:
 //   BRIGHTCOVE_ACCOUNT_ID, BRIGHTCOVE_CLIENT_ID, BRIGHTCOVE_CLIENT_SECRET, BRIGHTCOVE_PLAYER_ID
@@ -241,7 +242,7 @@ async function getAnalyticsForVideo(videoId, token) {
   return { id: videoId, title, tags, views, dailyAvgViews, impressions, engagement, playRate, secondsViewed };
 }
 
-/* ---------- NEW: Destination Path view sources (all-time) ---------- */
+/* ---------- Destination Path view sources (all-time) ---------- */
 async function getViewSources(videoId, token) {
   // Returns array of { url: 'https://domain/path', views: number }
   const base = 'https://analytics.api.brightcove.com/v1/data';
@@ -261,6 +262,16 @@ async function getViewSources(videoId, token) {
   );
 
   const items = data?.items || [];
+  // Debug print a small sample to logs to see exactly what's coming back
+  if (items.length) {
+    const sample = items.slice(0, 5).map(r => ({
+      domain: r.destination_domain, path: r.destination_path, views: r.video_view
+    }));
+    console.log(`[view-sources] video=${videoId} rows=${items.length} sample=`, sample);
+  } else {
+    console.log(`[view-sources] video=${videoId} rows=0`);
+  }
+
   const out = [];
   for (const it of items) {
     const dom = (it.destination_domain || '').trim();
@@ -560,6 +571,52 @@ app.get('/download', async (req, res) => {
   } catch (err) {
     console.error('Download error (top-level):', err?.response?.status, err?.response?.data || err.message);
     res.status(500).send('Error generating spreadsheet.');
+  }
+});
+
+/* ---------- Debug: inspect raw Brightcove destination data for a single video ---------- */
+app.get('/debug-destinations', async (req, res) => {
+  const videoId = (req.query.id || '').trim();
+  if (!videoId) return res.status(400).send('Please provide ?id=<videoId>');
+
+  try {
+    const token = await getAccessToken();
+    const base = 'https://analytics.api.brightcove.com/v1/data';
+    const params = new URLSearchParams({
+      accounts: AID,
+      dimensions: 'destination_domain,destination_path',
+      where: `video==${videoId}`,
+      from: 'alltime',
+      to: 'now',
+      fields: 'destination_domain,destination_path,video_view',
+      limit: '10000'
+    });
+    const url = `${base}?${params.toString()}`;
+
+    const { data } = await axiosHttp.get(url, { headers: { Authorization: `Bearer ${token}` } });
+    const items = data?.items || [];
+
+    console.log(`\n[DEBUG DESTINATIONS] Video ${videoId} — ${items.length} rows`);
+    for (const row of items.slice(0, 50)) { // cap console noise
+      console.log({
+        domain: row.destination_domain,
+        path: row.destination_path,
+        views: row.video_view
+      });
+    }
+
+    res.json({
+      videoId,
+      count: items.length,
+      data: items.map(r => ({
+        domain: r.destination_domain,
+        path: r.destination_path,
+        views: r.video_view
+      }))
+    });
+  } catch (err) {
+    console.error('Error fetching destinations:', err.response?.data || err.message);
+    res.status(500).send('Error fetching destination data.');
   }
 });
 
