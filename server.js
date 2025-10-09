@@ -427,12 +427,12 @@ app.get('/', async (req, res) => {
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Brightcove Video Tools</title>
+  <title>Brightcove Insights Portal</title>
   ${themeHead()}
 </head>
 <body>
   <header>
-    <h1>Brightcove Video Tools</h1>
+    <h1>Brightcove Insights Portal</h1>
     ${themeToggle()}
   </header>
   <main>
