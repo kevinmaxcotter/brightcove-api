@@ -1,20 +1,17 @@
-// server.js — Brightcove tools with Destination Path view sources (all-time) + Charts
+// server.js — Brightcove tools with Destination Path view sources (all-time) + Charts via QuickChart fallback
 // - Home: search form + most recent uploads
 // - Results: playable cards, tags, "Download Video Analytics Spreadsheet"
-// - Spreadsheet: all-time metrics + "View Sources (URLs & Views)"
-// - NEW: "Metrics Summary" sheet with rollups
-// - NEW: "Charts" sheet with embedded PNG charts (Top 20 Videos by Views, Top 10 Domains)
+// - Spreadsheet: all-time metrics + "View Sources (URLs & Views)" (exact URL when path present)
+// - NEW: "Metrics Summary" + "Charts" sheets (Charts rendered via QuickChart or local if available)
 // - Light/Dark toggle with emojis
-// - /healthz for health checks
-// - /debug-destinations?id=<VIDEO_ID> to inspect raw destination data
+// - /healthz, /debug-destinations, /debug-chart
 //
 // Env required:
 //   BRIGHTCOVE_ACCOUNT_ID, BRIGHTCOVE_CLIENT_ID, BRIGHTCOVE_CLIENT_SECRET, BRIGHTCOVE_PLAYER_ID
 // Optional:
 //   RECENT_LIMIT, DOWNLOAD_MAX_VIDEOS, METRICS_CONCURRENCY, EMBED_CONCURRENCY, DOWNLOAD_TIME_BUDGET_MS
-//
-// Extra dependency for charts:
-//   npm i chart.js chartjs-node-canvas
+//   CHARTS_PROVIDER=quickchart | local   (default auto-fallback to quickchart if local not available)
+//   CHARTS_QUICKCHART_URL (defaults to https://quickchart.io/chart)
 
 require('dotenv').config();
 const express = require('express');
@@ -22,15 +19,6 @@ const axios = require('axios');
 const ExcelJS = require('exceljs');
 const http = require('http');
 const https = require('https');
-
-// --- chart rendering (PNG) ---
-let ChartJSNodeCanvas;
-try {
-  // lazy require so app still runs if the package isn't installed yet
-  ChartJSNodeCanvas = require('chartjs-node-canvas').ChartJSNodeCanvas;
-} catch (e) {
-  console.warn('[charts] chartjs-node-canvas not installed; charts will be skipped.');
-}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -83,7 +71,7 @@ async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
   throw last;
 }
 const esc = s => String(s).replace(/"/g, '\\"');
-const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&gt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39'}[m]));
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 
 function titleContainsAll(video, terms) {
@@ -299,27 +287,57 @@ async function getViewSources(videoId, token) {
   return out;
 }
 
-/* ---------- chart helpers ---------- */
+/* ---------- chart helpers with QuickChart fallback ---------- */
+// We try local chartjs-node-canvas first; if unavailable, fall back to QuickChart.
+let ChartJSNodeCanvas;
+try {
+  ChartJSNodeCanvas = require('chartjs-node-canvas').ChartJSNodeCanvas;
+} catch (e) {
+  console.warn('[charts] chartjs-node-canvas not installed; will try QuickChart fallback.');
+}
+const CHARTS_PROVIDER = (process.env.CHARTS_PROVIDER || (ChartJSNodeCanvas ? 'local' : 'quickchart')).toLowerCase();
+const QUICKCHART_URL = process.env.CHARTS_QUICKCHART_URL || 'https://quickchart.io/chart';
+
+// Render a bar chart to a PNG Buffer (or null on failure)
 async function renderBarChartPNG({ title, labels, values, width = 1200, height = 700 }) {
-  if (!ChartJSNodeCanvas) return null;
-  const canvas = new ChartJSNodeCanvas({ width, height, backgroundColour: 'white' });
-  // IMPORTANT: no explicit colors; let Chart.js pick defaults
-  const cfg = {
-    type: 'bar',
-    data: { labels, datasets: [{ label: title, data: values }] },
-    options: {
-      responsive: false,
-      plugins: {
-        title: { display: true, text: title, font: { size: 18 } },
-        legend: { display: false }
-      },
-      scales: {
-        x: { ticks: { autoSkip: false, maxRotation: 45, minRotation: 0 } },
-        y: { beginAtZero: true }
-      }
+  if (CHARTS_PROVIDER === 'local' && ChartJSNodeCanvas) {
+    try {
+      const canvas = new ChartJSNodeCanvas({ width, height, backgroundColour: 'white' });
+      const cfg = {
+        type: 'bar',
+        data: { labels, datasets: [{ label: title, data: values }] },
+        options: {
+          responsive: false,
+          plugins: { title: { display: true, text: title, font: { size: 18 } }, legend: { display: false } },
+          scales: { x: { ticks: { autoSkip: false, maxRotation: 45, minRotation: 0 } }, y: { beginAtZero: true } }
+        }
+      };
+      return await canvas.renderToBuffer(cfg);
+    } catch (e) {
+      console.error('[charts] local renderer failed, falling back to QuickChart:', e.message);
     }
-  };
-  return await canvas.renderToBuffer(cfg);
+  }
+
+  // Fallback: QuickChart (hosted)
+  try {
+    const config = {
+      type: 'bar',
+      data: { labels, datasets: [{ label: title, data: values }] },
+      options: {
+        plugins: { title: { display: true, text: title }, legend: { display: false } },
+        scales: { y: { beginAtZero: true } }
+      }
+    };
+    const url = `${QUICKCHART_URL}?w=${width}&h=${height}&format=png&bkg=white`;
+    const { data } = await axios.post(url, { backgroundColor: 'white', width, height, format: 'png', chart: config }, {
+      responseType: 'arraybuffer',
+      timeout: 20000
+    });
+    return Buffer.from(data);
+  } catch (e) {
+    console.error('[charts] quickchart failed:', e.message);
+    return null;
+  }
 }
 
 function addImageToSheet(ws, wb, buffer, topLeftCell = 'A1', widthPx = 1000, heightPx = 580) {
@@ -330,7 +348,6 @@ function addImageToSheet(ws, wb, buffer, topLeftCell = 'A1', widthPx = 1000, hei
     ext: { width: widthPx, height: heightPx }
   });
 }
-
 function colFromA1(a1) { return a1.match(/[A-Z]+/i)[0].toUpperCase().split('').reduce((r,c)=>r*26+(c.charCodeAt(0)-64),0); }
 function rowFromA1(a1) { return parseInt(a1.match(/\d+/)[0],10); }
 
@@ -612,7 +629,7 @@ app.get('/download', async (req, res) => {
       if (!list.length) wf.addRow({ id: v.id, url: '(no destinations reported)', views: 0 });
     }
 
-    // 3) NEW: Metrics Summary (rollups + tables that feed our charts)
+    // 3) Metrics Summary (rollups + tables that feed our charts)
     const ws2 = wb.addWorksheet('Metrics Summary');
     ws2.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -638,12 +655,9 @@ app.get('/download', async (req, res) => {
     }
 
     // Domain rollup table (top 10)
-    const ws2StartRow = ws2.lastRow.number + 2;
-    ws2.addRow({});
-    const domainHeaderRow = ws2.addRow({ id: 'Domain', title: 'Views (All-Time)' });
-    domainHeaderRow.font = { bold: true };
+    ws2.addRow({}); // spacer
+    ws2.addRow({ id: 'Domain', title: 'Views (All-Time)' }).font = { bold: true };
 
-    // aggregate views by domain across all videos
     const domainViews = new Map(); // domain -> views
     for (const arr of sourcesMap.values()) {
       for (const s of arr) {
@@ -658,18 +672,15 @@ app.get('/download', async (req, res) => {
       .sort((a,b)=>b[1]-a[1]).slice(0,10);
     for (const [dom, v] of topDomains) ws2.addRow({ id: dom, title: v });
 
-    // 4) NEW: Charts sheet with embedded PNGs
+    // 4) Charts sheet with embedded PNGs (QuickChart or local)
     const chartsWs = wb.addWorksheet('Charts');
     chartsWs.getCell('A1').value = 'Charts';
     chartsWs.getCell('A1').font = { size: 16, bold: true };
 
     // Chart A: Top 20 videos by all-time views
-    const topVideos = numericRows
-      .sort((a,b)=>b.views - a.views)
-      .slice(0, 20);
+    const topVideos = numericRows.sort((a,b)=>b.views - a.views).slice(0, 20);
     const labelsA = topVideos.map(x => x.title.length>40 ? x.title.slice(0,37)+'…' : x.title);
     const dataA   = topVideos.map(x => x.views);
-
     let chartABuf = null;
     try {
       chartABuf = await renderBarChartPNG({
@@ -679,15 +690,12 @@ app.get('/download', async (req, res) => {
         width: 1400,
         height: 800
       });
-    } catch (e) {
-      console.error('[charts] failed to render Top Videos chart:', e.message);
-    }
+    } catch (e) { console.error('[charts] failed Top Videos chart:', e.message); }
     addImageToSheet(chartsWs, wb, chartABuf, 'A3', 1200, 650);
 
     // Chart B: Top 10 domains by views (from domain rollup)
     const labelsB = topDomains.map(([dom]) => dom);
     const dataB   = topDomains.map(([,v]) => v);
-
     let chartBBuf = null;
     try {
       chartBBuf = await renderBarChartPNG({
@@ -697,9 +705,7 @@ app.get('/download', async (req, res) => {
         width: 1200,
         height: 700
       });
-    } catch (e) {
-      console.error('[charts] failed to render Domain chart:', e.message);
-    }
+    } catch (e) { console.error('[charts] failed Domain chart:', e.message); }
     addImageToSheet(chartsWs, wb, chartBBuf, 'A40', 1000, 580);
 
     // ---- stream to client ----
@@ -756,6 +762,25 @@ app.get('/debug-destinations', async (req, res) => {
   } catch (err) {
     console.error('Error fetching destinations:', err.response?.data || err.message);
     res.status(500).send('Error fetching destination data.');
+  }
+});
+
+/* ---------- Extra: debug a chart image directly ---------- */
+app.get('/debug-chart', async (_req, res) => {
+  try {
+    const buf = await renderBarChartPNG({
+      title: 'Debug Chart',
+      labels: ['A','B','C','D','E'],
+      values: [5, 9, 3, 7, 4],
+      width: 800,
+      height: 500
+    });
+    if (!buf) return res.status(500).send('Chart buffer was null (renderer failed).');
+    res.setHeader('Content-Type', 'image/png');
+    res.send(buf);
+  } catch (e) {
+    console.error('[charts] debug error:', e.message);
+    res.status(500).send('Chart render error.');
   }
 });
 
