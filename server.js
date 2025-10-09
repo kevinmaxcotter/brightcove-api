@@ -1,8 +1,10 @@
-// server.js — Brightcove tools with Destination Path view sources (all-time) + Debug route
+// server.js — Brightcove tools with Destination Path view sources (all-time) + Charts
 // - Home: search form + most recent uploads
 // - Results: playable cards, tags, "Download Video Analytics Spreadsheet"
-// - Spreadsheet: all-time metrics + "View Sources (URLs & Views)" from Analytics (domain+path)
-// - Light/Dark toggle with emojis (unchanged labels)
+// - Spreadsheet: all-time metrics + "View Sources (URLs & Views)"
+// - NEW: "Metrics Summary" sheet with rollups
+// - NEW: "Charts" sheet with embedded PNG charts (Top 20 Videos by Views, Top 10 Domains)
+// - Light/Dark toggle with emojis
 // - /healthz for health checks
 // - /debug-destinations?id=<VIDEO_ID> to inspect raw destination data
 //
@@ -10,6 +12,9 @@
 //   BRIGHTCOVE_ACCOUNT_ID, BRIGHTCOVE_CLIENT_ID, BRIGHTCOVE_CLIENT_SECRET, BRIGHTCOVE_PLAYER_ID
 // Optional:
 //   RECENT_LIMIT, DOWNLOAD_MAX_VIDEOS, METRICS_CONCURRENCY, EMBED_CONCURRENCY, DOWNLOAD_TIME_BUDGET_MS
+//
+// Extra dependency for charts:
+//   npm i chart.js chartjs-node-canvas
 
 require('dotenv').config();
 const express = require('express');
@@ -17,6 +22,15 @@ const axios = require('axios');
 const ExcelJS = require('exceljs');
 const http = require('http');
 const https = require('https');
+
+// --- chart rendering (PNG) ---
+let ChartJSNodeCanvas;
+try {
+  // lazy require so app still runs if the package isn't installed yet
+  ChartJSNodeCanvas = require('chartjs-node-canvas').ChartJSNodeCanvas;
+} catch (e) {
+  console.warn('[charts] chartjs-node-canvas not installed; charts will be skipped.');
+}
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -69,7 +83,7 @@ async function withRetry(fn, { tries = 3, baseDelay = 400 } = {}) {
   throw last;
 }
 const esc = s => String(s).replace(/"/g, '\\"');
-const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
+const stripHtml = s => String(s).replace(/[&<>"']/g, m => ({'&':'&amp;','<':'&gt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[m]));
 const looksLikeId = s => /^\d{9,}$/.test(String(s).trim());
 
 function titleContainsAll(video, terms) {
@@ -262,7 +276,6 @@ async function getViewSources(videoId, token) {
   );
 
   const items = data?.items || [];
-  // Debug print a small sample to logs to see exactly what's coming back
   if (items.length) {
     const sample = items.slice(0, 5).map(r => ({
       domain: r.destination_domain, path: r.destination_path, views: r.video_view
@@ -285,6 +298,41 @@ async function getViewSources(videoId, token) {
   out.sort((a,b) => b.views - a.views);
   return out;
 }
+
+/* ---------- chart helpers ---------- */
+async function renderBarChartPNG({ title, labels, values, width = 1200, height = 700 }) {
+  if (!ChartJSNodeCanvas) return null;
+  const canvas = new ChartJSNodeCanvas({ width, height, backgroundColour: 'white' });
+  // IMPORTANT: no explicit colors; let Chart.js pick defaults
+  const cfg = {
+    type: 'bar',
+    data: { labels, datasets: [{ label: title, data: values }] },
+    options: {
+      responsive: false,
+      plugins: {
+        title: { display: true, text: title, font: { size: 18 } },
+        legend: { display: false }
+      },
+      scales: {
+        x: { ticks: { autoSkip: false, maxRotation: 45, minRotation: 0 } },
+        y: { beginAtZero: true }
+      }
+    }
+  };
+  return await canvas.renderToBuffer(cfg);
+}
+
+function addImageToSheet(ws, wb, buffer, topLeftCell = 'A1', widthPx = 1000, heightPx = 580) {
+  if (!buffer) return;
+  const imgId = wb.addImage({ buffer, extension: 'png' });
+  ws.addImage(imgId, {
+    tl: { col: colFromA1(topLeftCell)-1, row: rowFromA1(topLeftCell)-1 },
+    ext: { width: widthPx, height: heightPx }
+  });
+}
+
+function colFromA1(a1) { return a1.match(/[A-Z]+/i)[0].toUpperCase().split('').reduce((r,c)=>r*26+(c.charCodeAt(0)-64),0); }
+function rowFromA1(a1) { return parseInt(a1.match(/\d+/)[0],10); }
 
 /* ---------- UI (unchanged) ---------- */
 function themeHead(){ return `
@@ -447,7 +495,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Download (all-time analytics + destination paths) ---------- */
+/* ---------- Download (all-time analytics + destination paths + charts) ---------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -513,6 +561,8 @@ app.get('/download', async (req, res) => {
 
     // ---- build workbook ----
     const wb = new ExcelJS.Workbook();
+
+    // 1) Main metrics sheet
     const ws = wb.addWorksheet('Video Metrics (All-Time)');
     ws.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -534,7 +584,6 @@ app.get('/download', async (req, res) => {
 
     for (const r of rows) {
       const sources = sourcesMap.get(String(r.id)) || [];
-      // show top 10 in main sheet
       const top = sources.slice(0, 10).map(s => `${s.url} (${s.views})`).join(' ; ');
       ws.addRow({
         id: r.id,
@@ -550,7 +599,7 @@ app.get('/download', async (req, res) => {
       });
     }
 
-    // Optional detail sheet: one row per destination path with counts
+    // 2) Detail sheet: all destinations
     const wf = wb.addWorksheet('View Sources Detail');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -562,6 +611,96 @@ app.get('/download', async (req, res) => {
       for (const s of list) wf.addRow({ id: v.id, url: s.url, views: s.views });
       if (!list.length) wf.addRow({ id: v.id, url: '(no destinations reported)', views: 0 });
     }
+
+    // 3) NEW: Metrics Summary (rollups + tables that feed our charts)
+    const ws2 = wb.addWorksheet('Metrics Summary');
+    ws2.columns = [
+      { header: 'Video ID', key: 'id', width: 20 },
+      { header: 'Title', key: 'title', width: 40 },
+      { header: 'All-Time Views', key: 'views', width: 20 },
+      { header: 'Impressions', key: 'impressions', width: 18 },
+      { header: 'Engagement Score', key: 'engagement', width: 18 },
+      { header: 'Play Rate', key: 'playRate', width: 12 },
+      { header: 'Seconds Viewed', key: 'secondsViewed', width: 20 },
+    ];
+    const numericRows = [];
+    for (const r of rows) {
+      const vViews = typeof r.views === 'number' ? r.views : 0;
+      const vImp = typeof r.impressions === 'number' ? r.impressions : 0;
+      const vEng = typeof r.engagement === 'number' ? r.engagement : 0;
+      const vPlay= typeof r.playRate === 'number' ? r.playRate : 0;
+      const vSecs= typeof r.secondsViewed === 'number' ? r.secondsViewed : 0;
+      ws2.addRow({
+        id: r.id, title: r.title || titleById.get(String(r.id)) || 'Untitled',
+        views: vViews, impressions: vImp, engagement: vEng, playRate: vPlay, secondsViewed: vSecs
+      });
+      numericRows.push({ id: r.id, title: r.title || titleById.get(String(r.id)) || 'Untitled', views: vViews });
+    }
+
+    // Domain rollup table (top 10)
+    const ws2StartRow = ws2.lastRow.number + 2;
+    ws2.addRow({});
+    const domainHeaderRow = ws2.addRow({ id: 'Domain', title: 'Views (All-Time)' });
+    domainHeaderRow.font = { bold: true };
+
+    // aggregate views by domain across all videos
+    const domainViews = new Map(); // domain -> views
+    for (const arr of sourcesMap.values()) {
+      for (const s of arr) {
+        try {
+          const u = new URL(s.url);
+          const host = u.host.toLowerCase();
+          domainViews.set(host, (domainViews.get(host) || 0) + (Number(s.views)||0));
+        } catch {}
+      }
+    }
+    const topDomains = Array.from(domainViews.entries())
+      .sort((a,b)=>b[1]-a[1]).slice(0,10);
+    for (const [dom, v] of topDomains) ws2.addRow({ id: dom, title: v });
+
+    // 4) NEW: Charts sheet with embedded PNGs
+    const chartsWs = wb.addWorksheet('Charts');
+    chartsWs.getCell('A1').value = 'Charts';
+    chartsWs.getCell('A1').font = { size: 16, bold: true };
+
+    // Chart A: Top 20 videos by all-time views
+    const topVideos = numericRows
+      .sort((a,b)=>b.views - a.views)
+      .slice(0, 20);
+    const labelsA = topVideos.map(x => x.title.length>40 ? x.title.slice(0,37)+'…' : x.title);
+    const dataA   = topVideos.map(x => x.views);
+
+    let chartABuf = null;
+    try {
+      chartABuf = await renderBarChartPNG({
+        title: 'Top 20 Videos by All-Time Views',
+        labels: labelsA,
+        values: dataA,
+        width: 1400,
+        height: 800
+      });
+    } catch (e) {
+      console.error('[charts] failed to render Top Videos chart:', e.message);
+    }
+    addImageToSheet(chartsWs, wb, chartABuf, 'A3', 1200, 650);
+
+    // Chart B: Top 10 domains by views (from domain rollup)
+    const labelsB = topDomains.map(([dom]) => dom);
+    const dataB   = topDomains.map(([,v]) => v);
+
+    let chartBBuf = null;
+    try {
+      chartBBuf = await renderBarChartPNG({
+        title: 'Top 10 Domains by Views (All-Time)',
+        labels: labelsB,
+        values: dataB,
+        width: 1200,
+        height: 700
+      });
+    } catch (e) {
+      console.error('[charts] failed to render Domain chart:', e.message);
+    }
+    addImageToSheet(chartsWs, wb, chartBBuf, 'A40', 1000, 580);
 
     // ---- stream to client ----
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
@@ -597,7 +736,7 @@ app.get('/debug-destinations', async (req, res) => {
     const items = data?.items || [];
 
     console.log(`\n[DEBUG DESTINATIONS] Video ${videoId} — ${items.length} rows`);
-    for (const row of items.slice(0, 50)) { // cap console noise
+    for (const row of items.slice(0, 50)) {
       console.log({
         domain: row.destination_domain,
         path: row.destination_path,
