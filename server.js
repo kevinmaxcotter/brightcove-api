@@ -427,7 +427,7 @@ app.get('/', async (req, res) => {
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Brightcove Insights Portal</title>
+  <title><center>Brightcove Insights Portal</center></title>
   ${themeHead()}
 </head>
 <body>
