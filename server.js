@@ -456,7 +456,7 @@ app.get('/', async (req, res) => {
       <form action="/search" method="get">
         <input id="q" name="q" placeholder='Examples: 6376653485112, tag:"pega platform", title:"customer decision hub"' required />
         <button class="btn" type="submit" style="width:100%;margin-top:12px">Search</button>
-        <div class="id" style="margin-top:8px">IDs → exact match. Multiple tags → AND. Titles → must contain all terms.</div>
+        
       </form>
     </div>
 
