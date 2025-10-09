@@ -1,5 +1,14 @@
-// server.js — Brightcove tools with Analytics-based embed URLs (all-time)
-// Stable Excel export (addWorksheet + stream), unchanged UI/theme/search.
+// server.js — Brightcove tools with Destination Path view sources (all-time)
+// - Home: search form + most recent uploads
+// - Results: playable cards, tags, "Download Video Analytics Spreadsheet"
+// - Spreadsheet: all-time metrics + "View Sources (URLs & Views)" from Analytics
+// - Light/Dark toggle with emojis
+// - /healthz for platform health checks
+//
+// Env required:
+//   BRIGHTCOVE_ACCOUNT_ID, BRIGHTCOVE_CLIENT_ID, BRIGHTCOVE_CLIENT_SECRET, BRIGHTCOVE_PLAYER_ID
+// Optional:
+//   RECENT_LIMIT, DOWNLOAD_MAX_VIDEOS, METRICS_CONCURRENCY, EMBED_CONCURRENCY, DOWNLOAD_TIME_BUDGET_MS
 
 require('dotenv').config();
 const express = require('express');
@@ -28,7 +37,7 @@ const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
 const DOWNLOAD_MAX_VIDEOS = Number(process.env.DOWNLOAD_MAX_VIDEOS || 400);
 const DOWNLOAD_TIME_BUDGET_MS = Number(process.env.DOWNLOAD_TIME_BUDGET_MS || 60000);
 const METRICS_CONCURRENCY = Number(process.env.METRICS_CONCURRENCY || 6);
-const EMBED_CONCURRENCY = Number(process.env.EMBED_CONCURRENCY || 6);
+const EMBED_CONCURRENCY = Number(process.env.EMBED_CONCURRENCY || 6); // reused for destination sources
 
 const CMS_PAGE_LIMIT = 100;
 
@@ -147,7 +156,7 @@ function parseQuery(input) {
   return { ids, tagTerms, titleTerms };
 }
 
-/* ---------- unified search with strict local AND filter ---------- */
+/* ---------- unified search (ID or Tag AND + Title AND) ---------- */
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
 
@@ -232,8 +241,9 @@ async function getAnalyticsForVideo(videoId, token) {
   return { id: videoId, title, tags, views, dailyAvgViews, impressions, engagement, playRate, secondsViewed };
 }
 
-/* ---------- NEW: embed URLs from Analytics (all-time) ---------- */
-async function getEmbedUrlsFromAnalytics(videoId, token) {
+/* ---------- NEW: Destination Path view sources (all-time) ---------- */
+async function getViewSources(videoId, token) {
+  // Returns array of { url: 'https://domain/path', views: number }
   const base = 'https://analytics.api.brightcove.com/v1/data';
   const params = new URLSearchParams({
     accounts: AID,
@@ -241,6 +251,7 @@ async function getEmbedUrlsFromAnalytics(videoId, token) {
     where: `video==${videoId}`,
     from: 'alltime',
     to: 'now',
+    fields: 'destination_domain,destination_path,video_view',
     limit: '10000'
   });
   const url = `${base}?${params.toString()}`;
@@ -249,16 +260,18 @@ async function getEmbedUrlsFromAnalytics(videoId, token) {
     axiosHttp.get(url, { headers: { Authorization: `Bearer ${token}` } })
   );
 
-  const out = new Set();
   const items = data?.items || [];
+  const out = [];
   for (const it of items) {
     const dom = (it.destination_domain || '').trim();
     let path = (it.destination_path || '').trim();
     if (!dom) continue;
     if (!path) path = '/';
     if (!path.startsWith('/')) path = '/' + path;
-    out.add(`https://${dom}${path}`);
+    const views = Number(it.video_view || 0);
+    out.push({ url: `https://${dom}${path}`, views });
   }
+  out.sort((a,b) => b.views - a.views);
   return out;
 }
 
@@ -423,7 +436,7 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Download (all-time analytics + embed URLs from Analytics) ---------- */
+/* ---------- Download (all-time analytics + destination paths) ---------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
@@ -470,18 +483,18 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    // ---- embed URLs from Analytics (concurrent) ----
-    const embedsMap = new Map();
+    // ---- destination paths (concurrent) ----
+    const sourcesMap = new Map(); // id -> [{url,views}, ...]
     let idxE = 0;
     async function embedWorker() {
       while (idxE < videos.length) {
         const i = idxE++; const v = videos[i];
         try {
-          const urls = await getEmbedUrlsFromAnalytics(v.id, token);
-          embedsMap.set(String(v.id), urls);
+          const sources = await getViewSources(v.id, token);
+          sourcesMap.set(String(v.id), sources);
         } catch (e) {
-          console.error('embed urls error for', v.id, e?.response?.data || e.message);
-          embedsMap.set(String(v.id), new Set());
+          console.error('view sources error for', v.id, e?.response?.data || e.message);
+          sourcesMap.set(String(v.id), []);
         }
       }
     }
@@ -500,7 +513,7 @@ app.get('/download', async (req, res) => {
       { header: 'Play Rate', key: 'playRate', width: 12 },
       { header: 'Seconds Viewed', key: 'secondsViewed', width: 18 },
       { header: 'Tags', key: 'tags', width: 40 },
-      { header: 'Embedded On (URLs)', key: 'embeddedOn', width: 80 },
+      { header: 'View Sources (URLs & Views)', key: 'viewSources', width: 90 },
     ];
     if (truncated) ws.addRow({ id:'NOTE', title:`Export capped at ${DOWNLOAD_MAX_VIDEOS} newest items.` });
     if (Date.now() >= dlDeadline) ws.addRow({ id:'NOTE', title:`Export reached time budget; some rows may show N/A.` });
@@ -509,7 +522,9 @@ app.get('/download', async (req, res) => {
     const tagsById  = new Map(videos.map(v => [String(v.id), v.tags || []]));
 
     for (const r of rows) {
-      const urls = Array.from(embedsMap.get(String(r.id)) || []);
+      const sources = sourcesMap.get(String(r.id)) || [];
+      // show top 10 in main sheet
+      const top = sources.slice(0, 10).map(s => `${s.url} (${s.views})`).join(' ; ');
       ws.addRow({
         id: r.id,
         title: r.title || titleById.get(String(r.id)) || 'Untitled',
@@ -520,24 +535,24 @@ app.get('/download', async (req, res) => {
         playRate: r.playRate,
         secondsViewed: r.secondsViewed,
         tags: (r.tags && r.tags.length ? r.tags : tagsById.get(String(r.id)) || []).join(', '),
-        embeddedOn: urls.join(' ; ')
+        viewSources: top
       });
     }
 
-    // Optional sheet with one URL per row for easy filtering
-    const wf = wb.addWorksheet('Embeds Found');
+    // Optional detail sheet: one row per destination path with counts
+    const wf = wb.addWorksheet('View Sources Detail');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
       { header: 'Page URL', key: 'url', width: 90 },
+      { header: 'Views (All-Time)', key: 'views', width: 20 },
     ];
-    for (const [vid, set] of embedsMap.entries()) {
-      for (const u of set) wf.addRow({ id: vid, url: u });
-    }
-    if (![...embedsMap.values()].some(s => s && s.size)) {
-      wf.addRow({ id:'INFO', url:'No embed URLs returned by Analytics for selected videos (all-time).' });
+    for (const v of videos) {
+      const list = sourcesMap.get(String(v.id)) || [];
+      for (const s of list) wf.addRow({ id: v.id, url: s.url, views: s.views });
+      if (!list.length) wf.addRow({ id: v.id, url: '(no destinations reported)', views: 0 });
     }
 
-    // ---- stream to client (safer across ExcelJS versions) ----
+    // ---- stream to client ----
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics_alltime.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     await wb.xlsx.write(res);
