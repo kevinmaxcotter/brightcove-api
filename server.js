@@ -1,9 +1,4 @@
-// server.js — Brightcove Insights Dashboard
-// NOTE: Only changes vs. your last file:
-//   - Renamed title text to "Brightcove Insights Dashboard"
-//   - Centered that title in the header on all pages
-//
-// Everything else (search, metrics, date range support, glossary, charts, debug routes) is unchanged.
+// server.js — Brightcove Insights Dashboard (FULL APP, with top-left logo + centered title)
 
 require('dotenv').config();
 const express = require('express');
@@ -80,6 +75,7 @@ function hasAllTags(video, terms) {
 
 /* ---------- date range parsing (CUSTOM ONLY) ---------- */
 function normalizeRangeParams(query) {
+  // Accepts: ?from=YYYY-MM-DD&to=YYYY-MM-DD
   let from = (query.from || '').trim();
   let to   = (query.to || '').trim();
   if (from && to && yyyyMmDd.test(from) && yyyyMmDd.test(to)) {
@@ -163,12 +159,12 @@ function parseQuery(input) {
       continue;
     }
     if (looksLikeId(tok)) { ids.push(tok); continue; }
-    tagTerms.push(tok);
+    tagTerms.push(tok); // treat bare terms as tags (AND)
   }
   return { ids, tagTerms, titleTerms };
 }
 
-/* ---------- unified search ---------- */
+/* ---------- unified search (ID or Tag AND + Title AND) ---------- */
 async function unifiedSearch(input, token) {
   const { ids, tagTerms, titleTerms } = parseQuery(input);
 
@@ -300,7 +296,7 @@ async function getViewSources(videoId, token, range) {
     axiosHttp.get(url, { headers: { Authorization: `Bearer ${token}` } })
   );
 
-  const items = data?.items || [];
+  const items = (data?.items || []);
   const out = [];
   for (const it of items) {
     const dom = (it.destination_domain || '').trim();
@@ -359,7 +355,7 @@ function addImageToSheet(ws, wb, buffer, topLeftCell = 'A1', widthPx = 1000, hei
 function colFromA1(a1) { return a1.match(/[A-Z]+/i)[0].toUpperCase().split('').reduce((r,c)=>r*26+(c.charCodeAt(0)-64),0); }
 function rowFromA1(a1) { return parseInt(a1.match(/\d+/)[0],10); }
 
-/* ---------- UI (theme) ---------- */
+/* ---------- UI (theme + header layout w/ logo) ---------- */
 function themeHead(){ return `
 <link rel="preconnect" href="https://fonts.googleapis.com"><link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Open+Sans:wght@400;600;700&display=swap" rel="stylesheet">
@@ -369,7 +365,9 @@ function themeHead(){ return `
   *{box-sizing:border-box}
   body{font-family:'Open Sans',system-ui,-apple-system,Segoe UI,Roboto,Arial,sans-serif;background:var(--bg);color:var(--text);margin:0}
   header{position:relative;display:flex;align-items:center;justify-content:space-between;padding:20px;border-bottom:1px solid var(--border)}
-  header h1{position:absolute;left:50%;transform:translateX(-50%);margin:0;font-size:1.6rem;}
+  header h1{position:absolute;left:50%;transform:translateX(-50%);margin:0;font-size:1.6rem}
+  .brand{display:flex;align-items:center;gap:12px}
+  .logo{height:40px;width:auto;display:block}
   main{max-width:980px;margin:20px auto;padding:0 20px}
   .card{background:rgba(0,0,0,0.0);border:1px solid var(--border);border-radius:12px;padding:24px}
   input{width:100%;padding:12px 14px;border:1px solid var(--chipBorder);border-radius:10px;background:transparent;color:var(--text)}
@@ -445,7 +443,9 @@ app.get('/', async (req, res) => {
 </head>
 <body>
   <header>
-    <div></div>
+    <div class="brand">
+      <a href="/"><img src="https://raw.githubusercontent.com/kevinmaxcotter/brightcove-api/main/pega.png" class="logo" alt="Logo"></a>
+    </div>
     <h1>Brightcove Insights Dashboard</h1>
     ${themeToggle()}
   </header>
@@ -472,7 +472,7 @@ app.get('/', async (req, res) => {
 </html>`);
 });
 
-/* ---------- Results page ---------- */
+/* ---------- Results page (includes logo, centered title, custom range + glossary) ---------- */
 app.get('/search', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.redirect('/');
@@ -504,7 +504,10 @@ app.get('/search', async (req, res) => {
 </head>
 <body>
   <header>
-    <a href="/" style="text-decoration:none;color:var(--text)">← Back</a>
+    <div class="brand">
+      <a href="/"><img src="https://raw.githubusercontent.com/kevinmaxcotter/brightcove-api/main/pega.png" class="logo" alt="Logo"></a>
+      <a href="/" style="text-decoration:none;color:var(--text)">← Back</a>
+    </div>
     <h1>Brightcove Insights Dashboard</h1>
     ${themeToggle()}
   </header>
@@ -568,12 +571,12 @@ app.get('/search', async (req, res) => {
   }
 });
 
-/* ---------- Download (logic unchanged from your last version) ---------- */
+/* ---------- Download (all-time OR custom-range) ---------- */
 app.get('/download', async (req, res) => {
   const qInput = (req.query.q || '').trim();
   if (!qInput) return res.status(400).send('Missing search terms');
 
-  const range = normalizeRangeParams(req.query);
+  const range = normalizeRangeParams(req.query); // { mode:'alltime' } or { mode:'range', from, to }
   const dlDeadline = Date.now() + DOWNLOAD_TIME_BUDGET_MS;
 
   try {
@@ -581,11 +584,14 @@ app.get('/download', async (req, res) => {
     let videos = await unifiedSearch(qInput, token);
     if (!videos.length) return res.status(404).send('No videos found for that search.');
 
+    // cap for safety
     let truncated = false;
     if (videos.length > DOWNLOAD_MAX_VIDEOS) { videos = videos.slice(0, DOWNLOAD_MAX_VIDEOS); truncated = true; }
 
+    // ---- metrics (concurrent, deadline-guarded) ----
     const rows = new Array(videos.length);
     let idxA = 0;
+
     async function metricsWorker() {
       while (Date.now() < dlDeadline && idxA < videos.length) {
         const i = idxA++; const v = videos[i];
@@ -613,7 +619,8 @@ app.get('/download', async (req, res) => {
       }
     }
 
-    const sourcesMap = new Map();
+    // ---- destination paths (same window) ----
+    const sourcesMap = new Map(); // id -> [{url,views}, ...]
     let idxE = 0;
     async function embedWorker() {
       while (idxE < videos.length) {
@@ -629,8 +636,10 @@ app.get('/download', async (req, res) => {
     }
     await Promise.all(Array.from({ length: Math.min(EMBED_CONCURRENCY, videos.length) }, embedWorker));
 
+    // ---- build workbook ----
     const wb = new ExcelJS.Workbook();
 
+    // 0) Glossary
     const gl = wb.addWorksheet('Glossary');
     gl.columns = [{ header: 'Metric', key: 'm', width: 28 }, { header: 'Definition', key: 'd', width: 100 }];
     gl.addRow({ m:'Views', d:'Total video plays in the selected window (or lifetime if no dates).' });
@@ -641,6 +650,7 @@ app.get('/download', async (req, res) => {
     gl.addRow({ m:'Seconds Viewed', d:'Total watch time (sum of seconds watched) in the window.' });
     gl.addRow({ m:'View Sources', d:'Pages (domain + path) where views occurred, if Brightcove received path information.' });
 
+    // 1) Main metrics sheet
     const ws = wb.addWorksheet('Video Metrics');
     ws.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -681,6 +691,7 @@ app.get('/download', async (req, res) => {
       });
     }
 
+    // 2) Detail sheet: all destinations
     const wf = wb.addWorksheet('View Sources Detail');
     wf.columns = [
       { header: 'Video ID', key: 'id', width: 20 },
@@ -693,8 +704,68 @@ app.get('/download', async (req, res) => {
       if (!list.length) wf.addRow({ id: v.id, url: '(no destinations reported)', views: 0 });
     }
 
-    // (Charts logic unchanged — omitted here for brevity in the note; still in your codebase if previously included)
+    // 3) Metrics Summary + Charts
+    const ws2 = wb.addWorksheet('Metrics Summary');
+    ws2.columns = [
+      { header: 'Video ID', key: 'id', width: 20 },
+      { header: 'Title', key: 'title', width: 40 },
+      { header: range.mode==='range' ? 'Views (Range)' : 'All-Time Views', key: 'views', width: 20 },
+      { header: range.mode==='range' ? 'Impressions (Range)' : 'Impressions', key: 'impressions', width: 18 },
+      { header: 'Engagement Score', key: 'engagement', width: 18 },
+      { header: 'Play Rate', key: 'playRate', width: 12 },
+      { header: range.mode==='range' ? 'Seconds Viewed (Range)' : 'Seconds Viewed', key: 'secondsViewed', width: 20 },
+    ];
+    const numericRows = [];
+    for (const r of rows) {
+      const vViews = typeof r.views === 'number' ? r.views : 0;
+      const vImp = typeof r.impressions === 'number' ? r.impressions : 0;
+      const vEng = typeof r.engagement === 'number' ? r.engagement : 0;
+      const vPlay= typeof r.playRate === 'number' ? r.playRate : 0;
+      const vSecs= typeof r.secondsViewed === 'number' ? r.secondsViewed : 0;
+      ws2.addRow({
+        id: r.id, title: r.title || titleById.get(String(r.id)) || 'Untitled',
+        views: vViews, impressions: vImp, engagement: vEng, playRate: vPlay, secondsViewed: vSecs
+      });
+      numericRows.push({ id: r.id, title: r.title || titleById.get(String(r.id)) || 'Untitled', views: vViews });
+    }
 
+    const domainViews = new Map(); // domain -> views
+    for (const arr of sourcesMap.values()) {
+      for (const s of arr) {
+        try { const u = new URL(s.url); const host = u.host.toLowerCase();
+          domainViews.set(host, (domainViews.get(host) || 0) + (Number(s.views)||0));
+        } catch {}
+      }
+    }
+    ws2.addRow({}); ws2.addRow({ id:'Domain', title:'Views' }).font = { bold:true };
+    const topDomains = Array.from(domainViews.entries()).sort((a,b)=>b[1]-a[1]).slice(0,10);
+    for (const [dom, v] of topDomains) ws2.addRow({ id: dom, title: v });
+
+    // Charts
+    const chartsWs = new ExcelJS.Workbook().addWorksheet; // placeholder line to keep linter happy in some IDEs
+
+    const chartsSheet = wb.addWorksheet('Charts');
+    chartsSheet.getCell('A1').value = 'Charts';
+    chartsSheet.getCell('A1').font = { size: 16, bold: true };
+
+    const topVideos = numericRows.sort((a,b)=>b.views - a.views).slice(0, 20);
+    const labelsA = topVideos.map(x => x.title.length>40 ? x.title.slice(0,37)+'…' : x.title);
+    const dataA   = topVideos.map(x => x.views);
+    let chartABuf = null;
+    try {
+      chartABuf = await renderBarChartPNG({ title: 'Top 20 Videos by Views', labels: labelsA, values: dataA, width: 1400, height: 800 });
+    } catch (e) { console.error('[charts] top videos:', e.message); }
+    addImageToSheet(chartsSheet, wb, chartABuf, 'A3', 1200, 650);
+
+    const labelsB = topDomains.map(([dom]) => dom);
+    const dataB   = topDomains.map(([,v]) => v);
+    let chartBBuf = null;
+    try {
+      chartBBuf = await renderBarChartPNG({ title: 'Top 10 Domains by Views', labels: labelsB, values: dataB, width: 1200, height: 700 });
+    } catch (e) { console.error('[charts] domains:', e.message); }
+    addImageToSheet(chartsSheet, wb, chartBBuf, 'A40', 1000, 580);
+
+    // stream
     res.setHeader('Content-Disposition', 'attachment; filename=video_metrics.xlsx');
     res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
     await wb.xlsx.write(res);
@@ -733,13 +804,12 @@ app.get('/debug-destinations', async (req, res) => {
 /* ---------- Debug: chart ---------- */
 app.get('/debug-chart', async (_req, res) => {
   try {
-    // simple smoke test image
-    const buf = Buffer.from('89504e470d0a1a0a0000000d494844520000000a0000000a08020000000250' +
-      '58ea0000000c49444154789c6360606060600600060000ffff0300000605' +
-      '02f3c50000000049454e44ae426082','hex'); // tiny 10x10 PNG dot
+    const buf = await renderBarChartPNG({ title: 'Debug Chart', labels: ['A','B','C','D','E'], values: [5,9,3,7,4], width: 800, height: 500 });
+    if (!buf) return res.status(500).send('Chart buffer was null (renderer failed).');
     res.setHeader('Content-Type', 'image/png');
     res.send(buf);
   } catch (e) {
+    console.error('[charts] debug error:', e.message);
     res.status(500).send('Chart render error.');
   }
 });
