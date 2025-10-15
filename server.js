@@ -21,7 +21,7 @@ if (missing.length) console.error('Missing .env keys:', missing.join(', '));
 const AID = process.env.BRIGHTCOVE_ACCOUNT_ID || '';
 const PLAYER_ID = process.env.BRIGHTCOVE_PLAYER_ID || '';
 // Theme-aware logos (light/dark)
-const LOGO_LIGHT_URL = process.env.LOGO_LIGHT_URL || '/pega-light.png';
+const LOGO_LIGHT_URL = process.env.LOGO_LIGHT_URL || LOGO_DARK_URL;
 const LOGO_DARK_URL  = process.env.LOGO_DARK_URL  || LOGO_LIGHT_URL;
 
 const RECENT_LIMIT = Number(process.env.RECENT_LIMIT || 9);
@@ -447,7 +447,7 @@ app.get('/', async (req, res) => {
     ${warn}
     <div class="card" style="max-width:520px;margin:0 auto 20px">
       <h2>🔍 Search by ID, Tag(s), or Title</h2>
-      <form action="/search" method="get="q" placeholder='Examples: 6376653485112, tag:"pega platform", title:"customer decision hub"' required />
+      <form action="/search" method="get="q" placeholder='Examples: 6376653485112, tag:"platform", title:"customer decision hub"' required />
         <button class="btn" type="submit" style="width:100%;margin-top:12px">Search</button>
       </form>
     </div>
